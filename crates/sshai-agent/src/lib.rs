@@ -9,7 +9,13 @@ use anyhow::bail;
 pub struct ServeOptions {
     pub session_id: String,
     pub session_dir: PathBuf,
+    pub workspace_root: PathBuf,
 }
+
+#[cfg(unix)]
+mod exec;
+#[cfg(unix)]
+mod workspace;
 
 #[derive(Clone, Debug)]
 pub struct InvokeOptions {
@@ -43,6 +49,8 @@ mod unix {
         task::JoinSet,
     };
 
+    use super::exec::ExecManager;
+    use super::workspace::WorkspaceRoot;
     use super::{InvokeOptions, ServeOptions};
 
     type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<ControlResponse>>>>;
@@ -52,6 +60,7 @@ mod unix {
         validate_session_id(&options.session_id)?;
         prepare_session_directory(&options.session_dir).await?;
         let mut cleanup_guard = SessionDirectoryGuard(Some(options.session_dir.clone()));
+        let workspace = WorkspaceRoot::open(&options.workspace_root).await?;
         let socket_path = options.session_dir.join("agent.sock");
         let bin_dir = options.session_dir.join("bin");
         tokio::fs::create_dir(&bin_dir).await?;
@@ -79,13 +88,30 @@ mod unix {
                 session_id: options.session_id.clone(),
                 bin_dir: bin_dir.to_string_lossy().into_owned(),
                 shell_launcher: shell_launcher.to_string_lossy().into_owned(),
+                workspace_root: workspace.display(),
+                capabilities: WorkspaceRoot::capabilities(),
             },
         )
         .await?;
 
         let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (exec_manager, mut exec_events) = ExecManager::new();
+        let event_writer = writer.clone();
+        let event_dispatcher = tokio::spawn(async move {
+            while let Some(event) = exec_events.recv().await {
+                if let Err(error) =
+                    write_agent_message(&event_writer, &AgentToClient::ExecEvent(event)).await
+                {
+                    tracing::debug!(%error, "cannot send exec event");
+                    break;
+                }
+            }
+        });
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let reader_pending = pending.clone();
+        let reader_writer = writer.clone();
+        let reader_workspace = workspace.clone();
+        let reader_exec_manager = exec_manager.clone();
         let reader = tokio::spawn(async move {
             let mut stdin = tokio::io::stdin();
             loop {
@@ -93,6 +119,31 @@ mod unix {
                     Ok(ClientToAgent::Response(response)) => {
                         if let Some(sender) = reader_pending.lock().await.remove(&response.id) {
                             let _ = sender.send(response);
+                        }
+                    }
+                    Ok(ClientToAgent::WorkspaceRequest(request)) => {
+                        let writer = reader_writer.clone();
+                        let workspace = reader_workspace.clone();
+                        tokio::spawn(async move {
+                            let response = workspace.handle(request).await;
+                            if let Err(error) = write_agent_message(
+                                &writer,
+                                &AgentToClient::WorkspaceResponse(response),
+                            )
+                            .await
+                            {
+                                tracing::debug!(%error, "cannot send workspace response");
+                            }
+                        });
+                    }
+                    Ok(ClientToAgent::ExecStart(request)) => {
+                        let manager = reader_exec_manager.clone();
+                        let workspace = reader_workspace.clone();
+                        tokio::spawn(async move { manager.start(workspace, request).await });
+                    }
+                    Ok(ClientToAgent::ExecControl(control)) => {
+                        if let Err(error) = reader_exec_manager.control(control).await {
+                            tracing::debug!(%error, "cannot deliver exec control message");
                         }
                     }
                     Ok(ClientToAgent::Shutdown) => break,
@@ -141,8 +192,10 @@ mod unix {
         }
 
         connections.abort_all();
+        exec_manager.shutdown_all().await;
         pending.lock().await.clear();
         reader.abort();
+        event_dispatcher.abort();
         drop(listener);
         if let Err(error) = tokio::fs::remove_dir_all(&options.session_dir).await {
             tracing::debug!(%error, path = %options.session_dir.display(), "could not clean agent session directory");

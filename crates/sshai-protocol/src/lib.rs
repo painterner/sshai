@@ -4,8 +4,9 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 1;
+pub const PROTOCOL_VERSION: u16 = 2;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
+pub const MAX_WORKSPACE_READ: u32 = 512 * 1024;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -15,8 +16,12 @@ pub enum AgentToClient {
         session_id: String,
         bin_dir: String,
         shell_launcher: String,
+        workspace_root: String,
+        capabilities: Vec<String>,
     },
     Request(ControlRequest),
+    WorkspaceResponse(WorkspaceResponse),
+    ExecEvent(ExecEvent),
     Fatal {
         message: String,
     },
@@ -27,6 +32,9 @@ pub enum AgentToClient {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientToAgent {
     Response(ControlResponse),
+    WorkspaceRequest(WorkspaceRequest),
+    ExecStart(ExecStartRequest),
+    ExecControl(ExecControl),
     Shutdown,
 }
 
@@ -57,6 +65,185 @@ pub struct ShimResponse {
     pub exit_code: u8,
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceRequest {
+    pub id: u64,
+    pub operation: WorkspaceOperation,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case")]
+pub enum WorkspaceOperation {
+    Open,
+    List {
+        path: String,
+        cursor: Option<String>,
+        limit: u32,
+    },
+    Stat {
+        path: String,
+    },
+    Read {
+        path: String,
+        offset: u64,
+        length: u32,
+    },
+    Hash {
+        path: String,
+    },
+    Exec {
+        argv: Vec<String>,
+        cwd: String,
+        env: Vec<(String, String)>,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceResponse {
+    pub id: u64,
+    pub outcome: WorkspaceOutcome,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WorkspaceOutcome {
+    Ok { value: WorkspaceValue },
+    Error { code: String, message: String },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "value", rename_all = "snake_case")]
+pub enum WorkspaceValue {
+    Open {
+        root: String,
+        capabilities: Vec<String>,
+    },
+    List {
+        entries: Vec<WorkspaceEntry>,
+        next_cursor: Option<String>,
+    },
+    Stat {
+        metadata: WorkspaceMetadata,
+    },
+    Read {
+        data_base64: String,
+        eof: bool,
+    },
+    Hash {
+        algorithm: String,
+        digest: String,
+    },
+    Exec {
+        exit_code: Option<i32>,
+        stdout_base64: String,
+        stderr_base64: String,
+        truncated: bool,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceEntry {
+    pub name: String,
+    pub metadata: WorkspaceMetadata,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorkspaceMetadata {
+    pub kind: WorkspaceFileKind,
+    pub size: u64,
+    pub modified_unix_ms: Option<u64>,
+    pub mode: Option<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkspaceFileKind {
+    File,
+    Directory,
+    Symlink,
+    Other,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecStartRequest {
+    pub request_id: u64,
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub env: Vec<(String, String)>,
+    pub mode: ExecMode,
+    pub shell: bool,
+    pub term: Option<String>,
+    pub terminal: Option<TerminalSize>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecMode {
+    Pipe,
+    Pty,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct TerminalSize {
+    pub columns: u16,
+    pub rows: u16,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ExecControl {
+    pub process_id: u64,
+    pub action: ExecControlAction,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum ExecControlAction {
+    Input { data_base64: String },
+    Resize { size: TerminalSize },
+    Signal { signal: ExecSignal },
+    Cancel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecSignal {
+    Interrupt,
+    Terminate,
+    Kill,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum ExecEvent {
+    Started {
+        request_id: u64,
+        process_id: u64,
+    },
+    Output {
+        process_id: u64,
+        stream: ExecStream,
+        data_base64: String,
+    },
+    Exited {
+        process_id: u64,
+        exit_code: Option<i32>,
+        signal: Option<i32>,
+    },
+    Failed {
+        request_id: u64,
+        process_id: Option<u64>,
+        message: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecStream {
+    Stdout,
+    Stderr,
+    Pty,
 }
 
 #[derive(Debug, Error)]
@@ -126,6 +313,10 @@ mod tests {
             ClientToAgent::Response(response) => {
                 assert_eq!(response.id, 42);
                 assert_eq!(response.exit_code, 7);
+            }
+            ClientToAgent::WorkspaceRequest(_) => panic!("unexpected workspace request"),
+            ClientToAgent::ExecStart(_) | ClientToAgent::ExecControl(_) => {
+                panic!("unexpected exec message")
             }
             ClientToAgent::Shutdown => panic!("unexpected shutdown"),
         }

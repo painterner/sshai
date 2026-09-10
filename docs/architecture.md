@@ -112,3 +112,25 @@ Frames are big-endian length-prefixed JSON with a 1 MiB bound and explicit proto
 EOF or an explicit shutdown frame stops the agent and removes the complete session directory. Content-addressed executable caches are retained, but are streamed through SHA-256 before execution and immediately after upload.
 
 The protocol crate does not depend on `russh`, leaving the transport replaceable and making future file sync and AI adapters independently testable.
+
+## Workspace RPC v1
+
+The same control channel also carries local-to-agent workspace requests. Request IDs make responses unambiguous and allow the remote agent to execute independent requests concurrently:
+
+```text
+open                         canonical root + negotiated capabilities
+list(path, cursor, limit)    sorted, name-based pagination
+stat(path)                   lstat-style metadata for the final component
+read(path, offset, length)   bounded range read, base64 payload
+hash(path)                   streaming BLAKE3
+exec.start(argv, cwd, env)   streaming process start
+exec.input / resize          PTY input and window changes
+exec.signal / cancel         process-group control
+exec.output / exited         backpressured events and final status
+```
+
+Filesystem paths are relative-only. The agent normalizes components, canonicalizes the target or its parent, and verifies it remains under the canonical workspace root. This rejects absolute paths, parent traversal, and symlink escapes while still allowing `stat` to report a final symlink itself.
+
+`exec` constrains and canonicalizes its initial working directory, validates environment names, and uses argv directly without a shell by default. Pipe mode streams distinct stdout/stderr chunks through a bounded event queue. PTY mode uses `openpty`, creates a new session and foreground process group, forwards stdin/`TERM`/window resize, and merges output with normal terminal semantics. `--shell` is explicit and requires one command string.
+
+Every command has both a protocol process ID and an OS process group. The first Ctrl-C sends `SIGINT`; a second cancels with `SIGKILL`. Timeout, explicit cancellation, control-channel EOF, and agent shutdown target the complete process group so descendants cannot be orphaned. This remains execution isolation, not an OS sandbox: the process retains the authenticated remote user's normal permissions.

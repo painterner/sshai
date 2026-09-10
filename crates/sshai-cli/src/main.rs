@@ -4,8 +4,10 @@ use anyhow::{Context, Result};
 use clap::{ArgAction, Parser, Subcommand};
 use sshai_core::Target;
 use sshai_ssh::{
-    ConnectOptions, HostKeyPolicy, KeyInstallResult, SshConnector, discover_public_identities,
+    ConnectOptions, HostKeyPolicy, KeyInstallResult, MAX_WORKSPACE_READ, SshConnector,
+    WorkspaceClient, WorkspaceMetadata, WorkspaceStreamExecOptions, discover_public_identities,
 };
+use tokio::io::AsyncWriteExt;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -75,6 +77,15 @@ enum Command {
         operation: SftpOperation,
     },
 
+    /// Inspect files rooted in, or execute commands from, the remote workspace.
+    Workspace {
+        /// `host`, `user@host:/path`, or `ssh://user@host:port/path`.
+        target: Target,
+
+        #[command(subcommand)]
+        operation: WorkspaceOperation,
+    },
+
     /// Install local public keys in the remote user's authorized_keys.
     CopyId {
         /// `host`, `user@host`, or `ssh://user@host:port`.
@@ -127,6 +138,49 @@ enum SftpOperation {
 }
 
 #[derive(Debug, Subcommand)]
+enum WorkspaceOperation {
+    /// Open the workspace and print negotiated capabilities.
+    Open,
+    /// List a directory, with stable name-based pagination.
+    List {
+        #[arg(default_value = ".")]
+        path: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 200)]
+        limit: u32,
+    },
+    /// Read file metadata without following the final symlink.
+    Stat { path: String },
+    /// Read a bounded file range and write the bytes to stdout.
+    Read {
+        path: String,
+        #[arg(long, default_value_t = 0)]
+        offset: u64,
+        #[arg(long, default_value_t = MAX_WORKSPACE_READ)]
+        length: u32,
+    },
+    /// Calculate a BLAKE3 digest remotely.
+    Hash { path: String },
+    /// Execute a command with real-time output and optional PTY support.
+    #[command(trailing_var_arg = true)]
+    Exec {
+        #[arg(long, default_value = ".")]
+        cwd: String,
+        #[arg(long = "env", value_name = "KEY=VALUE")]
+        env: Vec<String>,
+        /// Allocate a remote pseudo-terminal and forward input and resize events.
+        #[arg(long)]
+        pty: bool,
+        /// Execute exactly one command string through the remote login shell.
+        #[arg(long)]
+        shell: bool,
+        #[arg(required = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 enum AgentOperation {
     #[command(hide = true)]
     Serve {
@@ -134,6 +188,8 @@ enum AgentOperation {
         session_id: String,
         #[arg(long)]
         session_dir: PathBuf,
+        #[arg(long)]
+        workspace_root: PathBuf,
     },
 
     #[command(hide = true, trailing_var_arg = true)]
@@ -211,6 +267,17 @@ async fn run(cli: Cli) -> Result<u8> {
             session.disconnect().await?;
             eprintln!("transferred {bytes} bytes");
             Ok(0)
+        }
+        Command::Workspace { target, operation } => {
+            let session = connector.connect(&target).await?;
+            let mut workspace = session.workspace().await?;
+            let operation_result = run_workspace_operation(&mut workspace, operation).await;
+            let close_result = workspace.close().await;
+            let disconnect_result = session.disconnect().await;
+            let code = operation_result?;
+            close_result?;
+            disconnect_result?;
+            Ok(code)
         }
         Command::CopyId {
             target,
@@ -300,10 +367,12 @@ async fn run_agent(operation: AgentOperation) -> Result<u8> {
         AgentOperation::Serve {
             session_id,
             session_dir,
+            workspace_root,
         } => {
             sshai_agent::serve(sshai_agent::ServeOptions {
                 session_id,
                 session_dir,
+                workspace_root,
             })
             .await?;
             Ok(0)
@@ -320,6 +389,114 @@ async fn run_agent(operation: AgentOperation) -> Result<u8> {
             })
             .await
         }
+    }
+}
+
+async fn run_workspace_operation(
+    workspace: &mut WorkspaceClient,
+    operation: WorkspaceOperation,
+) -> Result<u8> {
+    match operation {
+        WorkspaceOperation::Open => {
+            let (root, capabilities) = workspace.open().await?;
+            println!("root: {root}");
+            println!("capabilities: {}", capabilities.join(", "));
+            Ok(0)
+        }
+        WorkspaceOperation::List {
+            path,
+            cursor,
+            limit,
+        } => {
+            let (entries, next_cursor) = workspace.list(path, cursor, limit).await?;
+            for entry in entries {
+                println!(
+                    "{}\t{}\t{}",
+                    file_kind(&entry.metadata),
+                    entry.metadata.size,
+                    entry.name
+                );
+            }
+            if let Some(cursor) = next_cursor {
+                eprintln!("next cursor: {cursor}");
+            }
+            Ok(0)
+        }
+        WorkspaceOperation::Stat { path } => {
+            let metadata = workspace.stat(path).await?;
+            println!("kind: {}", file_kind(&metadata));
+            println!("size: {}", metadata.size);
+            if let Some(modified) = metadata.modified_unix_ms {
+                println!("modified_unix_ms: {modified}");
+            }
+            if let Some(mode) = metadata.mode {
+                println!("mode: {:o}", mode);
+            }
+            Ok(0)
+        }
+        WorkspaceOperation::Read {
+            path,
+            offset,
+            length,
+        } => {
+            let (data, _) = workspace.read(path, offset, length).await?;
+            let mut stdout = tokio::io::stdout();
+            stdout.write_all(&data).await?;
+            stdout.flush().await?;
+            Ok(0)
+        }
+        WorkspaceOperation::Hash { path } => {
+            let (algorithm, digest) = workspace.hash(path).await?;
+            println!("{algorithm}:{digest}");
+            Ok(0)
+        }
+        WorkspaceOperation::Exec {
+            cwd,
+            env,
+            pty,
+            shell,
+            command,
+        } => {
+            let env = env
+                .into_iter()
+                .map(|value| {
+                    value.split_once('=').map_or_else(
+                        || anyhow::bail!("--env requires KEY=VALUE, got {value:?}"),
+                        |(key, value)| Ok((key.to_owned(), value.to_owned())),
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if shell && command.len() != 1 {
+                anyhow::bail!(
+                    "--shell requires exactly one quoted command string, for example: --shell -- 'ls | head'"
+                );
+            }
+            let result = workspace
+                .exec_to_terminal(WorkspaceStreamExecOptions {
+                    argv: command,
+                    cwd,
+                    env,
+                    pty,
+                    shell,
+                })
+                .await?;
+            Ok(match (result.exit_code, result.signal) {
+                (Some(code), _) => u8::try_from(code.clamp(0, 255)).unwrap_or(255),
+                (None, Some(signal)) => {
+                    u8::try_from((128_i32 + signal).clamp(0, 255)).unwrap_or(255)
+                }
+                (None, None) => 255,
+            })
+        }
+    }
+}
+
+fn file_kind(metadata: &WorkspaceMetadata) -> &'static str {
+    match metadata.kind {
+        sshai_ssh::WorkspaceFileKind::File => "file",
+        sshai_ssh::WorkspaceFileKind::Directory => "directory",
+        sshai_ssh::WorkspaceFileKind::Symlink => "symlink",
+        sshai_ssh::WorkspaceFileKind::Other => "other",
     }
 }
 

@@ -66,6 +66,24 @@ sshai copy-id -i '~/.ssh/id_ed25519.pub'
 
 `-i` 指向的是本机文件；请像上例一样引用 `~`，避免它先被远端 Shell 展开。请求通过独立的加密 SSH Channel 传输，不解析或匹配终端输入字符。若要连接不支持 agent 的主机，可显式使用 `sshai ssh --no-agent HOST`。
 
+通过 Workspace RPC 检查远端工作区：
+
+```bash
+sshai workspace dev-server:/srv/project open
+sshai workspace dev-server:/srv/project list . --limit 200
+sshai workspace dev-server:/srv/project stat Cargo.toml
+sshai workspace dev-server:/srv/project read README.md
+sshai workspace dev-server:/srv/project hash Cargo.lock
+sshai workspace dev-server:/srv/project exec -- cargo test
+sshai workspace dev-server:/srv/project exec --cwd crates/core --env RUST_LOG=debug -- cargo test
+sshai workspace dev-server:/srv/project exec --pty -- ls --color=auto -C
+sshai workspace dev-server:/srv/project exec --pty --shell -- 'ls'
+```
+
+`list/stat/read/hash` 只能访问工作区根目录内的相对路径；绝对路径、`..` 和指向根目录外的符号链接都会被拒绝。`list` 使用稳定的名称游标分页，`read` 每次最多读取 512 KiB。
+
+Workspace `exec` 默认直接使用 argv 启动进程，不经过 Shell，以独立 stdout/stderr 事件实时返回，适合 AI 和脚本。`--pty` 会分配远端伪终端、转发 stdin、`TERM`、窗口尺寸、resize 和终端信号，适合颜色、列布局和交互程序；PTY 中 stdout/stderr 按终端语义合流。`--shell` 要求一个完整命令字符串，并通过远端登录 Shell 执行，以显式启用 alias、管道和重定向。执行工作目录必须位于工作区内，但进程仍拥有远端 SSH 用户本身的权限。命令有 300 秒超时，SSH/Agent 断开会终止整个远端进程组。
+
 在远程工作区执行命令：
 
 ```bash
@@ -149,6 +167,7 @@ ServerAliveCountMax
 - 加密私钥和密码只在内存中短暂存在。
 - SFTP 默认拒绝覆盖；覆盖必须显式传入 `--force`。
 - agent 控制协议使用带长度上限的版本化帧；每个 shim 请求都校验随机会话令牌。
+- Workspace RPC 使用独立 request/process ID 和结构化错误，支持 `open/list/stat/read/hash` 以及流式 pipe/PTY exec。
 - shim 只存在于当前会话的 `PATH`，socket 为 `0600`，会话目录为 `0700`。
 - 缓存 agent 在执行前通过 SFTP 流式 SHA-256 校验，上传后再次校验。
 

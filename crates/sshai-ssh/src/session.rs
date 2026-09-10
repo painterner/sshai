@@ -18,7 +18,7 @@ use tokio::io::AsyncReadExt;
 use crate::{
     HostKeyPolicy, KeyInstallResult, ResolvedTarget, Result, SshConfig, SshError,
     agent::RemoteAgent, auth::authenticate, discover_public_identities, host_key::ClientHandler,
-    sftp::SftpClient,
+    sftp::SftpClient, workspace::WorkspaceClient,
 };
 
 #[derive(Clone, Debug, Default)]
@@ -360,12 +360,18 @@ impl SshSession {
             &remote_home,
             &format!(".cache/sshai/s/{}", &session_id[..24]),
         );
+        let remote_workspace_root = match self.target.path.as_deref() {
+            None | Some("~") => remote_home,
+            Some(path) if path.starts_with('/') => path.to_owned(),
+            Some(path) => join_remote_path(&remote_home, path),
+        };
         sftp.close().await?;
         let command = format!(
-            "exec {} agent serve --session-id {} --session-dir {}",
+            "exec {} agent serve --session-id {} --session-dir {} --workspace-root {}",
             shell_quote(&remote_executable),
             shell_quote(&session_id),
             shell_quote(&remote_session_dir),
+            shell_quote(&remote_workspace_root),
         );
         let channel = self.session.channel_open_session().await?;
         channel.exec(true, command).await?;
@@ -410,6 +416,10 @@ impl SshSession {
     pub async fn interactive_shell_with_agent(&self) -> Result<CommandExit> {
         let agent = self.start_agent().await?;
         self.interactive_shell_inner(Some(agent)).await
+    }
+
+    pub async fn workspace(&self) -> Result<WorkspaceClient> {
+        Ok(WorkspaceClient::new(self.start_agent().await?))
     }
 
     async fn interactive_shell_inner(&self, mut agent: Option<RemoteAgent>) -> Result<CommandExit> {
@@ -748,14 +758,14 @@ fn shell_quote(value: &str) -> String {
 }
 
 #[cfg(unix)]
-struct RawTerminalGuard {
+pub(crate) struct RawTerminalGuard {
     original: nix::sys::termios::Termios,
     original_flags: i32,
 }
 
 #[cfg(unix)]
 impl RawTerminalGuard {
-    fn activate() -> Result<Self> {
+    pub(crate) fn activate() -> Result<Self> {
         use nix::sys::termios::{SetArg, cfmakeraw, tcgetattr, tcsetattr};
 
         let stdin = std::io::stdin();
@@ -808,11 +818,11 @@ impl Drop for RawTerminalGuard {
 }
 
 #[cfg(not(unix))]
-struct RawTerminalGuard;
+pub(crate) struct RawTerminalGuard;
 
 #[cfg(not(unix))]
 impl RawTerminalGuard {
-    fn activate() -> Result<Self> {
+    pub(crate) fn activate() -> Result<Self> {
         Err(SshError::Config(
             "interactive terminal mode is not implemented on this platform".to_owned(),
         ))
@@ -831,19 +841,19 @@ impl std::os::fd::AsRawFd for StdinDescriptor {
 }
 
 #[cfg(unix)]
-struct InteractiveStdin {
+pub(crate) struct InteractiveStdin {
     inner: tokio::io::unix::AsyncFd<StdinDescriptor>,
 }
 
 #[cfg(unix)]
 impl InteractiveStdin {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             inner: tokio::io::unix::AsyncFd::new(StdinDescriptor)?,
         })
     }
 
-    async fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    pub(crate) async fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         loop {
             let mut readiness = self.inner.readable().await?;
             let result = readiness.try_io(|_| {
@@ -873,25 +883,25 @@ impl InteractiveStdin {
 }
 
 #[cfg(not(unix))]
-struct InteractiveStdin {
+pub(crate) struct InteractiveStdin {
     inner: tokio::io::Stdin,
 }
 
 #[cfg(not(unix))]
 impl InteractiveStdin {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self {
             inner: tokio::io::stdin(),
         })
     }
 
-    async fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+    pub(crate) async fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         self.inner.read(buffer).await
     }
 }
 
 #[cfg(unix)]
-fn terminal_size() -> (u32, u32) {
+pub(crate) fn terminal_size() -> (u32, u32) {
     let mut size = nix::libc::winsize {
         ws_row: 0,
         ws_col: 0,
@@ -909,36 +919,36 @@ fn terminal_size() -> (u32, u32) {
 }
 
 #[cfg(not(unix))]
-fn terminal_size() -> (u32, u32) {
+pub(crate) fn terminal_size() -> (u32, u32) {
     (80, 24)
 }
 
 #[cfg(unix)]
-struct ResizeEvents(tokio::signal::unix::Signal);
+pub(crate) struct ResizeEvents(tokio::signal::unix::Signal);
 
 #[cfg(unix)]
 impl ResizeEvents {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self(tokio::signal::unix::signal(
             tokio::signal::unix::SignalKind::window_change(),
         )?))
     }
 
-    async fn recv(&mut self) {
+    pub(crate) async fn recv(&mut self) {
         self.0.recv().await;
     }
 }
 
 #[cfg(not(unix))]
-struct ResizeEvents;
+pub(crate) struct ResizeEvents;
 
 #[cfg(not(unix))]
 impl ResizeEvents {
-    fn new() -> Result<Self> {
+    pub(crate) fn new() -> Result<Self> {
         Ok(Self)
     }
 
-    async fn recv(&mut self) {
+    pub(crate) async fn recv(&mut self) {
         std::future::pending::<()>().await;
     }
 }
