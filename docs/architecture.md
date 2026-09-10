@@ -15,6 +15,13 @@ sshai-ssh ─── SSH / PTY / SFTP / local control dispatcher
                              │
                              ▼
                        sshai-agent ─── Unix socket / session shim
+                             ▲
+                             │
+                       sshai-tools ─── canonical schemas + dispatcher
+                          ▲       ▲
+                          │       │
+                  sshai-mcp     sshai-ai
+                  stdio MCP     local model loop
    │
    ▼
 russh + russh-sftp + Tokio
@@ -97,7 +104,7 @@ Interactive SSH enables the agent by default:
 local sshai
   ├─ SFTP: detect platform, SHA-256 verify/cache/upload same binary
   ├─ PTY channel: remote interactive shell
-  └─ control channel: remote `sshai agent serve`
+  └─ control channel: remote `sshai worker serve`
                            │
                            ├─ 0700 random session directory
                            ├─ 0600 Unix socket
@@ -134,3 +141,23 @@ Filesystem paths are relative-only. The agent normalizes components, canonicaliz
 `exec` constrains and canonicalizes its initial working directory, validates environment names, and uses argv directly without a shell by default. Pipe mode streams distinct stdout/stderr chunks through a bounded event queue. PTY mode uses `openpty`, creates a new session and foreground process group, forwards stdin/`TERM`/window resize, and merges output with normal terminal semantics. `--shell` is explicit and requires one command string.
 
 Every command has both a protocol process ID and an OS process group. The first Ctrl-C sends `SIGINT`; a second cancels with `SIGKILL`. Timeout, explicit cancellation, control-channel EOF, and agent shutdown target the complete process group so descendants cannot be orphaned. This remains execution isolation, not an OS sandbox: the process retains the authenticated remote user's normal permissions.
+
+## Mutations and optimistic concurrency
+
+Workspace RPC v3 adds atomic write, unique text edit, mkdir, rename, and remove. Mutations are serialized within one agent. A write targets a create-new temporary file in the destination directory, applies validated permissions, flushes and `fsync`s the file, rechecks the expected BLAKE3 immediately before replacement, atomically renames, and syncs the parent directory. Failed operations remove their temporary file.
+
+Existing files require an expected BLAKE3 or an explicit overwrite flag. Text edit reads a bounded UTF-8 file, requires `old_text` to occur exactly once, derives a BLAKE3 condition from the bytes it read, and uses the same atomic write path. All mutation parents pass the same canonical root and symlink-escape validation as reads.
+
+## MCP and Codex adapter
+
+`sshai-tools` owns the deterministic JSON schemas, side-effect classification, argument validation, and dispatch to one authenticated `WorkspaceClient`. Both model entry points use this canonical implementation.
+
+`sshai mcp TARGET` is a local stdio MCP server. It returns tool failures as `isError` results so the model can self-correct and keeps diagnostics off protocol stdout. Mutating and arbitrary-exec tools carry conservative destructive annotations.
+
+`sshai codex TARGET` launches the existing local Codex executable in a temporary control directory. It injects the MCP command and arguments with process-local `-c` overrides, leaves the user's Codex home and authentication untouched, forces the empty local shell workspace read-only, and supplies both MCP server instructions and an `AGENTS.md` directing all project operations to the remote tools. No persistent Codex configuration is written.
+
+## Built-in AI agent
+
+`sshai agent TARGET` runs the model orchestration locally and gives it Responses API function tools derived from the same canonical definitions as MCP. Conversation input, model output items, function calls, and function outputs are retained locally for the session and sent statelessly with `store=false`; encrypted reasoning content is requested so reasoning-capable models can continue across tool calls without server-side response storage.
+
+The API credential is read only from the local environment and is used only in the HTTPS Authorization header. The remote worker receives workspace RPC frames, never the model credential. Read-only tools run directly. Mutations and arbitrary execution pass through the CLI approval policy before dispatch. A per-turn tool-call bound prevents an erroneous model loop from executing indefinitely.

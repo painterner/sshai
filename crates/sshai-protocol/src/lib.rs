@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_WORKSPACE_READ: u32 = 512 * 1024;
 
@@ -93,10 +93,31 @@ pub enum WorkspaceOperation {
     Hash {
         path: String,
     },
-    Exec {
-        argv: Vec<String>,
-        cwd: String,
-        env: Vec<(String, String)>,
+    Write {
+        path: String,
+        data_base64: String,
+        expected_blake3: Option<String>,
+        overwrite: bool,
+        mode: Option<u32>,
+    },
+    Edit {
+        path: String,
+        old_text: String,
+        new_text: String,
+        expected_blake3: Option<String>,
+    },
+    Mkdir {
+        path: String,
+        recursive: bool,
+    },
+    Rename {
+        from: String,
+        to: String,
+        overwrite: bool,
+    },
+    Remove {
+        path: String,
+        recursive: bool,
     },
 }
 
@@ -135,11 +156,10 @@ pub enum WorkspaceValue {
         algorithm: String,
         digest: String,
     },
-    Exec {
-        exit_code: Option<i32>,
-        stdout_base64: String,
-        stderr_base64: String,
-        truncated: bool,
+    Mutation {
+        path: String,
+        metadata: Option<WorkspaceMetadata>,
+        blake3: Option<String>,
     },
 }
 

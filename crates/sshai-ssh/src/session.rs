@@ -76,16 +76,34 @@ impl SshConnector {
     }
 
     pub async fn connect(&self, target: &Target) -> Result<SshSession> {
+        let connect_started = Instant::now();
         let final_target = self.resolve(target)?;
         let mut route = Vec::new();
         self.build_route(&final_target, &mut Vec::new(), &mut route)?;
         route.push(final_target.clone());
 
+        tracing::debug!(
+            target = %target,
+            host = %final_target.host,
+            port = final_target.port,
+            user = %final_target.user,
+            hops = route.len(),
+            "SSH connection starting"
+        );
+
         let mut sessions: Vec<client::Handle<ClientHandler>> = Vec::with_capacity(route.len());
         let mut auth_methods = Vec::with_capacity(route.len());
-        for next in route {
+        for (hop_index, next) in route.into_iter().enumerate() {
+            let hop_started = Instant::now();
             let next = Arc::new(next);
             let mut session = if let Some(parent) = sessions.last() {
+                let proxy_started = Instant::now();
+                tracing::debug!(
+                    host = %next.host,
+                    port = next.port,
+                    hop = hop_index + 1,
+                    "opening ProxyJump channel"
+                );
                 let channel = parent
                     .channel_open_direct_tcpip(
                         next.host.clone(),
@@ -94,9 +112,31 @@ impl SshConnector {
                         0,
                     )
                     .await?;
-                self.connect_stream(next.clone(), channel.into_stream())
-                    .await?
+                tracing::debug!(
+                    host = %next.host,
+                    port = next.port,
+                    elapsed_ms = proxy_started.elapsed().as_millis() as u64,
+                    "ProxyJump channel opened"
+                );
+                let handshake_started = Instant::now();
+                let session = self
+                    .connect_stream(next.clone(), channel.into_stream())
+                    .await?;
+                tracing::debug!(
+                    host = %next.host,
+                    port = next.port,
+                    elapsed_ms = handshake_started.elapsed().as_millis() as u64,
+                    "SSH protocol handshake completed"
+                );
+                session
             } else {
+                let tcp_started = Instant::now();
+                tracing::debug!(
+                    host = %next.host,
+                    port = next.port,
+                    hop = hop_index + 1,
+                    "opening TCP connection"
+                );
                 let stream = match tokio::time::timeout(
                     next.connect_timeout,
                     TcpStream::connect((next.host.as_str(), next.port)),
@@ -119,12 +159,34 @@ impl SshConnector {
                         });
                     }
                 };
+                tracing::debug!(
+                    host = %next.host,
+                    port = next.port,
+                    elapsed_ms = tcp_started.elapsed().as_millis() as u64,
+                    "TCP connection established"
+                );
                 stream.set_nodelay(true)?;
-                self.connect_stream(next.clone(), stream).await?
+                let handshake_started = Instant::now();
+                let session = self.connect_stream(next.clone(), stream).await?;
+                tracing::debug!(
+                    host = %next.host,
+                    port = next.port,
+                    elapsed_ms = handshake_started.elapsed().as_millis() as u64,
+                    "SSH protocol handshake completed"
+                );
+                session
             };
+            let auth_started = Instant::now();
+            tracing::debug!(host = %next.host, user = %next.user, "SSH authentication starting");
             let auth_method =
                 authenticate(&mut session, &next, self.options.allow_password).await?;
-            tracing::debug!(host = %next.host, method = %auth_method, "SSH authentication succeeded");
+            tracing::debug!(
+                host = %next.host,
+                method = %auth_method,
+                elapsed_ms = auth_started.elapsed().as_millis() as u64,
+                hop_elapsed_ms = hop_started.elapsed().as_millis() as u64,
+                "SSH authentication succeeded"
+            );
             auth_methods.push(auth_method);
             sessions.push(session);
         }
@@ -133,6 +195,11 @@ impl SshConnector {
             SshError::Config("internal error: connection route is empty".to_owned())
         })?;
         let auth_method = auth_methods.pop().unwrap_or_else(|| "unknown".to_owned());
+        tracing::debug!(
+            host = %final_target.host,
+            elapsed_ms = connect_started.elapsed().as_millis() as u64,
+            "SSH connection ready"
+        );
         Ok(SshSession {
             target: Arc::new(final_target),
             session,
@@ -322,13 +389,33 @@ impl SshSession {
     }
 
     async fn start_agent(&self) -> Result<RemoteAgent> {
+        let agent_started = Instant::now();
+        tracing::debug!(host = %self.target.host, "remote agent startup beginning");
+
+        let phase_started = Instant::now();
         self.verify_agent_platform().await?;
+        tracing::debug!(
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            "remote platform verified"
+        );
+
         let local_executable = std::env::current_exe().map_err(SshError::Io)?;
+        let phase_started = Instant::now();
         let digest = executable_digest(&local_executable).await?;
+        tracing::debug!(
+            path = %local_executable.display(),
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            "local agent executable hashed"
+        );
         let session_id = random_session_id()?;
 
+        let phase_started = Instant::now();
         let sftp = self.sftp().await?;
         let remote_home = sftp.remote_home().await?;
+        tracing::debug!(
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            "SFTP bootstrap channel ready"
+        );
         let bundle = format!(
             "{}-{}-{}-{}",
             env!("CARGO_PKG_VERSION"),
@@ -338,17 +425,44 @@ impl SshSession {
         );
         let remote_bin_dir = join_remote_path(&remote_home, &format!(".cache/sshai/bin/{bundle}"));
         let remote_executable = join_remote_path(&remote_bin_dir, "sshai");
+        let phase_started = Instant::now();
         sftp.ensure_dir_all(remote_bin_dir, 0o700).await?;
-        if sftp.sha256(remote_executable.clone()).await?.as_deref() != Some(&digest) {
+        tracing::debug!(
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            "remote agent cache directory ready"
+        );
+
+        let phase_started = Instant::now();
+        let cached_digest = sftp.sha256(remote_executable.clone()).await?;
+        let cache_hit = cached_digest.as_deref() == Some(&digest);
+        tracing::debug!(
+            cache_hit,
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            "remote agent cache checked"
+        );
+        if !cache_hit {
+            let phase_started = Instant::now();
             sftp.upload(&local_executable, remote_executable.clone(), true)
                 .await?;
+            tracing::debug!(
+                elapsed_ms = phase_started.elapsed().as_millis() as u64,
+                "remote agent executable uploaded"
+            );
+
+            let phase_started = Instant::now();
+            let uploaded_digest = sftp.sha256(remote_executable.clone()).await?;
+            if uploaded_digest.as_deref() != Some(&digest) {
+                return Err(SshError::Agent(
+                    "remote agent binary failed post-upload checksum verification".to_owned(),
+                ));
+            }
+            tracing::debug!(
+                elapsed_ms = phase_started.elapsed().as_millis() as u64,
+                "uploaded agent executable verified"
+            );
         }
-        let uploaded_digest = sftp.sha256(remote_executable.clone()).await?;
-        if uploaded_digest.as_deref() != Some(&digest) {
-            return Err(SshError::Agent(
-                "remote agent binary failed post-upload checksum verification".to_owned(),
-            ));
-        }
+
+        let phase_started = Instant::now();
         sftp.set_permissions(remote_executable.clone(), 0o700)
             .await?;
 
@@ -366,16 +480,27 @@ impl SshSession {
             Some(path) => join_remote_path(&remote_home, path),
         };
         sftp.close().await?;
+        tracing::debug!(
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            "remote agent session prepared"
+        );
         let command = format!(
-            "exec {} agent serve --session-id {} --session-dir {} --workspace-root {}",
+            "exec {} worker serve --session-id {} --session-dir {} --workspace-root {}",
             shell_quote(&remote_executable),
             shell_quote(&session_id),
             shell_quote(&remote_session_dir),
             shell_quote(&remote_workspace_root),
         );
+        let phase_started = Instant::now();
         let channel = self.session.channel_open_session().await?;
         channel.exec(true, command).await?;
-        RemoteAgent::connect(channel.into_stream(), &session_id).await
+        let agent = RemoteAgent::connect(channel.into_stream(), &session_id).await?;
+        tracing::debug!(
+            elapsed_ms = phase_started.elapsed().as_millis() as u64,
+            total_elapsed_ms = agent_started.elapsed().as_millis() as u64,
+            "remote agent ready"
+        );
+        Ok(agent)
     }
 
     async fn verify_agent_platform(&self) -> Result<()> {

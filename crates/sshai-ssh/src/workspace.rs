@@ -12,12 +12,21 @@ use crate::{
     session::{InteractiveStdin, RawTerminalGuard, ResizeEvents, terminal_size},
 };
 
+const MAX_CAPTURED_EXEC_STREAM: usize = 192 * 1024;
+
 #[derive(Debug)]
 pub struct WorkspaceExecResult {
     pub exit_code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
     pub truncated: bool,
+}
+
+#[derive(Debug)]
+pub struct WorkspaceMutation {
+    pub path: String,
+    pub metadata: Option<WorkspaceMetadata>,
+    pub blake3: Option<String>,
 }
 
 #[derive(Debug)]
@@ -138,41 +147,195 @@ impl WorkspaceClient {
         }
     }
 
+    pub async fn write(
+        &mut self,
+        path: impl Into<String>,
+        data: &[u8],
+        expected_blake3: Option<String>,
+        overwrite: bool,
+        mode: Option<u32>,
+    ) -> Result<WorkspaceMutation> {
+        match self
+            .agent
+            .workspace_request(WorkspaceOperation::Write {
+                path: path.into(),
+                data_base64: BASE64.encode(data),
+                expected_blake3,
+                overwrite,
+                mode,
+            })
+            .await?
+        {
+            WorkspaceValue::Mutation {
+                path,
+                metadata,
+                blake3,
+            } => Ok(WorkspaceMutation {
+                path,
+                metadata,
+                blake3,
+            }),
+            value => Err(unexpected("write", &value)),
+        }
+    }
+
+    pub async fn edit(
+        &mut self,
+        path: impl Into<String>,
+        old_text: String,
+        new_text: String,
+        expected_blake3: Option<String>,
+    ) -> Result<WorkspaceMutation> {
+        match self
+            .agent
+            .workspace_request(WorkspaceOperation::Edit {
+                path: path.into(),
+                old_text,
+                new_text,
+                expected_blake3,
+            })
+            .await?
+        {
+            WorkspaceValue::Mutation {
+                path,
+                metadata,
+                blake3,
+            } => Ok(WorkspaceMutation {
+                path,
+                metadata,
+                blake3,
+            }),
+            value => Err(unexpected("edit", &value)),
+        }
+    }
+
+    pub async fn mkdir(
+        &mut self,
+        path: impl Into<String>,
+        recursive: bool,
+    ) -> Result<WorkspaceMutation> {
+        self.mutation_request(
+            "mkdir",
+            WorkspaceOperation::Mkdir {
+                path: path.into(),
+                recursive,
+            },
+        )
+        .await
+    }
+
+    pub async fn rename(
+        &mut self,
+        from: impl Into<String>,
+        to: impl Into<String>,
+        overwrite: bool,
+    ) -> Result<WorkspaceMutation> {
+        self.mutation_request(
+            "rename",
+            WorkspaceOperation::Rename {
+                from: from.into(),
+                to: to.into(),
+                overwrite,
+            },
+        )
+        .await
+    }
+
+    pub async fn remove(
+        &mut self,
+        path: impl Into<String>,
+        recursive: bool,
+    ) -> Result<WorkspaceMutation> {
+        self.mutation_request(
+            "remove",
+            WorkspaceOperation::Remove {
+                path: path.into(),
+                recursive,
+            },
+        )
+        .await
+    }
+
+    async fn mutation_request(
+        &mut self,
+        operation_name: &str,
+        operation: WorkspaceOperation,
+    ) -> Result<WorkspaceMutation> {
+        match self.agent.workspace_request(operation).await? {
+            WorkspaceValue::Mutation {
+                path,
+                metadata,
+                blake3,
+            } => Ok(WorkspaceMutation {
+                path,
+                metadata,
+                blake3,
+            }),
+            value => Err(unexpected(operation_name, &value)),
+        }
+    }
+
     pub async fn exec(
         &mut self,
         argv: Vec<String>,
         cwd: impl Into<String>,
         env: Vec<(String, String)>,
     ) -> Result<WorkspaceExecResult> {
-        match self
+        let process_id = self
             .agent
-            .workspace_request(WorkspaceOperation::Exec {
+            .start_exec(ExecStartRequest {
+                request_id: 0,
                 argv,
                 cwd: cwd.into(),
                 env,
+                mode: ExecMode::Pipe,
+                shell: false,
+                term: None,
+                terminal: None,
             })
-            .await?
-        {
-            WorkspaceValue::Exec {
-                exit_code,
-                stdout_base64,
-                stderr_base64,
-                truncated,
-            } => {
-                let stdout = BASE64.decode(stdout_base64).map_err(|error| {
-                    SshError::Agent(format!("invalid exec stdout payload: {error}"))
-                })?;
-                let stderr = BASE64.decode(stderr_base64).map_err(|error| {
-                    SshError::Agent(format!("invalid exec stderr payload: {error}"))
-                })?;
-                Ok(WorkspaceExecResult {
-                    exit_code,
-                    stdout,
-                    stderr,
-                    truncated,
-                })
+            .await?;
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut truncated = false;
+        loop {
+            match self.agent.next_exec_event(process_id).await? {
+                ExecEvent::Output {
+                    stream,
+                    data_base64,
+                    ..
+                } => {
+                    let data = BASE64.decode(data_base64).map_err(|error| {
+                        SshError::Agent(format!("invalid exec output payload: {error}"))
+                    })?;
+                    let output = match stream {
+                        ExecStream::Stdout => &mut stdout,
+                        ExecStream::Stderr => &mut stderr,
+                        ExecStream::Pty => {
+                            return Err(SshError::Agent(
+                                "received PTY output for a pipe command".to_owned(),
+                            ));
+                        }
+                    };
+                    let remaining = MAX_CAPTURED_EXEC_STREAM.saturating_sub(output.len());
+                    let keep = remaining.min(data.len());
+                    output.extend_from_slice(&data[..keep]);
+                    truncated |= keep < data.len();
+                }
+                ExecEvent::Exited { exit_code, .. } => {
+                    return Ok(WorkspaceExecResult {
+                        exit_code,
+                        stdout,
+                        stderr,
+                        truncated,
+                    });
+                }
+                ExecEvent::Failed { message, .. } => return Err(SshError::Agent(message)),
+                ExecEvent::Started { .. } => {
+                    return Err(SshError::Agent(
+                        "received a duplicate exec start event".to_owned(),
+                    ));
+                }
             }
-            value => Err(unexpected("exec", &value)),
         }
     }
 

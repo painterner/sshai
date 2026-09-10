@@ -22,5 +22,6 @@ pub use sshai_protocol::{
     MAX_WORKSPACE_READ, WorkspaceEntry, WorkspaceFileKind, WorkspaceMetadata,
 };
 pub use workspace::{
-    WorkspaceClient, WorkspaceExecResult, WorkspaceStreamExecOptions, WorkspaceStreamExecResult,
+    WorkspaceClient, WorkspaceExecResult, WorkspaceMutation, WorkspaceStreamExecOptions,
+    WorkspaceStreamExecResult,
 };

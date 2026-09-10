@@ -1,9 +1,11 @@
 use std::{
     io::SeekFrom,
     path::{Component, Path, PathBuf},
-    process::Stdio,
-    sync::Arc,
-    time::{Duration, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::UNIX_EPOCH,
 };
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -14,17 +16,19 @@ use sshai_protocol::{
 };
 use tokio::{
     fs,
-    io::{AsyncRead, AsyncReadExt, AsyncSeekExt},
-    process::Command,
+    io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
+    sync::Mutex,
 };
 
 const MAX_LIST_ENTRIES: u32 = 1_000;
-const MAX_EXEC_OUTPUT_PER_STREAM: usize = 192 * 1024;
-const EXEC_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_WORKSPACE_WRITE: usize = 512 * 1024;
+const MAX_EDIT_FILE: u64 = 16 * 1024 * 1024;
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub(crate) struct WorkspaceRoot {
     canonical: Arc<PathBuf>,
+    mutations: Arc<Mutex<()>>,
 }
 
 impl WorkspaceRoot {
@@ -38,6 +42,7 @@ impl WorkspaceRoot {
         }
         Ok(Self {
             canonical: Arc::new(canonical),
+            mutations: Arc::new(Mutex::new(())),
         })
     }
 
@@ -52,6 +57,11 @@ impl WorkspaceRoot {
             "stat",
             "read",
             "blake3",
+            "write_atomic",
+            "edit",
+            "mkdir",
+            "rename",
+            "remove",
             "exec",
             "exec_stream",
             "pty",
@@ -93,7 +103,38 @@ impl WorkspaceRoot {
                 length,
             } => self.read(&path, offset, length).await,
             WorkspaceOperation::Hash { path } => self.hash(&path).await,
-            WorkspaceOperation::Exec { argv, cwd, env } => self.exec(argv, &cwd, env).await,
+            WorkspaceOperation::Write {
+                path,
+                data_base64,
+                expected_blake3,
+                overwrite,
+                mode,
+            } => {
+                self.write(
+                    &path,
+                    &data_base64,
+                    expected_blake3.as_deref(),
+                    overwrite,
+                    mode,
+                )
+                .await
+            }
+            WorkspaceOperation::Edit {
+                path,
+                old_text,
+                new_text,
+                expected_blake3,
+            } => {
+                self.edit(&path, &old_text, &new_text, expected_blake3.as_deref())
+                    .await
+            }
+            WorkspaceOperation::Mkdir { path, recursive } => self.mkdir(&path, recursive).await,
+            WorkspaceOperation::Rename {
+                from,
+                to,
+                overwrite,
+            } => self.rename(&from, &to, overwrite).await,
+            WorkspaceOperation::Remove { path, recursive } => self.remove(&path, recursive).await,
         }
     }
 
@@ -175,80 +216,213 @@ impl WorkspaceRoot {
         if !fs::metadata(&candidate).await?.is_file() {
             bail!("not a regular file: {path}");
         }
-        let mut file = fs::File::open(candidate).await?;
-        let mut hasher = blake3::Hasher::new();
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer).await?;
-            if read == 0 {
-                break;
-            }
-            hasher.update(&buffer[..read]);
-        }
         Ok(WorkspaceValue::Hash {
             algorithm: "blake3".to_owned(),
-            digest: hasher.finalize().to_hex().to_string(),
+            digest: hash_file(&candidate).await?,
         })
     }
 
-    async fn exec(
+    async fn write(
         &self,
-        argv: Vec<String>,
-        cwd: &str,
-        env: Vec<(String, String)>,
+        path: &str,
+        data_base64: &str,
+        expected_blake3: Option<&str>,
+        overwrite: bool,
+        mode: Option<u32>,
     ) -> Result<WorkspaceValue> {
-        let executable = argv
-            .first()
-            .ok_or_else(|| anyhow!("exec argv cannot be empty"))?;
-        if env
-            .iter()
-            .any(|(key, _)| key.is_empty() || key.contains('='))
-        {
-            bail!("environment variable names must be non-empty and cannot contain '='");
+        let data = BASE64
+            .decode(data_base64)
+            .context("invalid workspace write payload")?;
+        if data.len() > MAX_WORKSPACE_WRITE {
+            bail!("write payload exceeds {MAX_WORKSPACE_WRITE} bytes");
         }
-        let cwd = self.resolve_existing(cwd).await?;
-        if !fs::metadata(&cwd).await?.is_dir() {
-            bail!("exec cwd is not a directory");
+        if mode.is_some_and(|mode| mode & !0o777 != 0) {
+            bail!("file mode may only contain Unix permission bits (0000-0777)");
         }
+        let _guard = self.mutations.lock().await;
+        self.write_atomic_unlocked(path, &data, expected_blake3, overwrite, mode)
+            .await
+    }
 
-        let mut command = Command::new(executable);
-        command
-            .args(&argv[1..])
-            .current_dir(cwd)
-            .envs(env)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
-        let mut child = command.spawn().context("cannot spawn workspace command")?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow!("missing stdout"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| anyhow!("missing stderr"))?;
-        let stdout_task = tokio::spawn(read_bounded(stdout));
-        let stderr_task = tokio::spawn(read_bounded(stderr));
-        let status = match tokio::time::timeout(EXEC_TIMEOUT, child.wait()).await {
-            Ok(status) => status?,
-            Err(_) => {
-                let _ = child.kill().await;
-                bail!(
-                    "workspace command timed out after {} seconds",
-                    EXEC_TIMEOUT.as_secs()
-                );
+    async fn edit(
+        &self,
+        path: &str,
+        old_text: &str,
+        new_text: &str,
+        expected_blake3: Option<&str>,
+    ) -> Result<WorkspaceValue> {
+        if old_text.is_empty() {
+            bail!("old_text cannot be empty");
+        }
+        let _guard = self.mutations.lock().await;
+        let candidate = self.resolve_existing(path).await?;
+        let metadata = fs::metadata(&candidate).await?;
+        if !metadata.is_file() {
+            bail!("not a regular file: {path}");
+        }
+        if metadata.len() > MAX_EDIT_FILE {
+            bail!("file is too large for text edit (maximum {MAX_EDIT_FILE} bytes)");
+        }
+        let contents = fs::read(&candidate).await?;
+        let source_digest = blake3::hash(&contents).to_hex().to_string();
+        if let Some(expected) = expected_blake3 {
+            validate_expected_digest(expected)?;
+            if !source_digest.eq_ignore_ascii_case(expected) {
+                bail!("write conflict: expected BLAKE3 {expected}, found {source_digest}");
             }
+        }
+        let text = std::str::from_utf8(&contents).context("file is not valid UTF-8")?;
+        let mut matches = text.match_indices(old_text);
+        let (start, _) = matches
+            .next()
+            .ok_or_else(|| anyhow!("old_text was not found"))?;
+        if matches.next().is_some() {
+            bail!("old_text is not unique; provide more surrounding context");
+        }
+        let mut edited = String::with_capacity(text.len() - old_text.len() + new_text.len());
+        edited.push_str(&text[..start]);
+        edited.push_str(new_text);
+        edited.push_str(&text[start + old_text.len()..]);
+        if edited.len() > MAX_WORKSPACE_WRITE {
+            bail!("edited file exceeds the {MAX_WORKSPACE_WRITE}-byte atomic write limit");
+        }
+        self.write_atomic_unlocked(path, edited.as_bytes(), Some(&source_digest), true, None)
+            .await
+    }
+
+    async fn mkdir(&self, path: &str, recursive: bool) -> Result<WorkspaceValue> {
+        let _guard = self.mutations.lock().await;
+        let relative = mutable_relative(path)?;
+        let target = if recursive {
+            let mut current = self.canonical.as_ref().clone();
+            for component in relative.components() {
+                let Component::Normal(name) = component else {
+                    unreachable!("mutable_relative only returns normal components")
+                };
+                current.push(name);
+                match fs::symlink_metadata(&current).await {
+                    Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                    Ok(_) => bail!(
+                        "refusing non-directory or symlinked path {}",
+                        current.display()
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        fs::create_dir(&current).await?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            current
+        } else {
+            let target = self.resolve_leaf(path).await?;
+            fs::create_dir(&target).await?;
+            target
         };
-        let (stdout, stdout_truncated) = stdout_task.await??;
-        let (stderr, stderr_truncated) = stderr_task.await??;
-        Ok(WorkspaceValue::Exec {
-            exit_code: status.code(),
-            stdout_base64: BASE64.encode(stdout),
-            stderr_base64: BASE64.encode(stderr),
-            truncated: stdout_truncated || stderr_truncated,
-        })
+        mutation_value(path, Some(fs::symlink_metadata(target).await?), None)
+    }
+
+    async fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<WorkspaceValue> {
+        let _guard = self.mutations.lock().await;
+        mutable_relative(from)?;
+        mutable_relative(to)?;
+        let source = self.resolve_leaf(from).await?;
+        fs::symlink_metadata(&source).await?;
+        let destination = self.resolve_leaf(to).await?;
+        if !overwrite && path_exists(&destination).await? {
+            bail!("destination already exists: {to}");
+        }
+        fs::rename(source, &destination).await?;
+        mutation_value(to, Some(fs::symlink_metadata(destination).await?), None)
+    }
+
+    async fn remove(&self, path: &str, recursive: bool) -> Result<WorkspaceValue> {
+        let _guard = self.mutations.lock().await;
+        mutable_relative(path)?;
+        let target = self.resolve_leaf(path).await?;
+        let metadata = fs::symlink_metadata(&target).await?;
+        if metadata.is_dir() && !metadata.file_type().is_symlink() {
+            if recursive {
+                fs::remove_dir_all(target).await?;
+            } else {
+                fs::remove_dir(target).await?;
+            }
+        } else {
+            fs::remove_file(target).await?;
+        }
+        mutation_value(path, None, None)
+    }
+
+    async fn write_atomic_unlocked(
+        &self,
+        path: &str,
+        data: &[u8],
+        expected_blake3: Option<&str>,
+        overwrite: bool,
+        requested_mode: Option<u32>,
+    ) -> Result<WorkspaceValue> {
+        mutable_relative(path)?;
+        let target = self.resolve_leaf(path).await?;
+        let existing = match fs::symlink_metadata(&target).await {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(metadata) = &existing {
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                bail!("refusing to replace non-regular or symlinked file: {path}");
+            }
+            if expected_blake3.is_none() && !overwrite {
+                bail!("file already exists; provide expected_blake3 or set overwrite=true");
+            }
+        } else if expected_blake3.is_some() {
+            bail!("file does not exist but expected_blake3 was provided");
+        }
+        verify_expected_hash(&target, expected_blake3).await?;
+
+        let parent = target
+            .parent()
+            .ok_or_else(|| anyhow!("workspace file has no parent directory"))?;
+        let temporary = parent.join(format!(
+            ".sshai-write-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let operation = async {
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&temporary)
+                .await?;
+            let mode = requested_mode.or_else(|| existing.as_ref().and_then(permission_mode));
+            if let Some(mode) = mode {
+                set_permissions(&temporary, mode).await?;
+            }
+            file.write_all(data).await?;
+            file.flush().await?;
+            file.sync_all().await?;
+            drop(file);
+            // Recheck immediately before the atomic replace to catch concurrent edits.
+            verify_expected_hash(&target, expected_blake3).await?;
+            if existing.is_none() && !overwrite && path_exists(&target).await? {
+                bail!("write conflict: file was created concurrently: {path}");
+            }
+            fs::rename(&temporary, &target).await?;
+            if let Err(error) = sync_directory(parent).await {
+                tracing::warn!(%error, path = %parent.display(), "atomic write committed but directory fsync is unavailable");
+            }
+            Ok::<_, anyhow::Error>(())
+        }
+        .await;
+        if operation.is_err() {
+            let _ = fs::remove_file(&temporary).await;
+        }
+        operation?;
+        let metadata = fs::symlink_metadata(&target).await?;
+        mutation_value(
+            path,
+            Some(metadata),
+            Some(blake3::hash(data).to_hex().to_string()),
+        )
     }
 
     async fn resolve_existing(&self, path: &str) -> Result<PathBuf> {
@@ -285,6 +459,106 @@ impl WorkspaceRoot {
     }
 }
 
+fn mutable_relative(path: &str) -> Result<PathBuf> {
+    let relative = validate_relative(path)?;
+    if relative.as_os_str().is_empty() {
+        bail!("refusing to mutate the workspace root");
+    }
+    Ok(relative)
+}
+
+async fn path_exists(path: &Path) -> Result<bool> {
+    match fs::symlink_metadata(path).await {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn verify_expected_hash(path: &Path, expected: Option<&str>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    validate_expected_digest(expected)?;
+    let actual = hash_file(path).await?;
+    if !actual.eq_ignore_ascii_case(expected) {
+        bail!("write conflict: expected BLAKE3 {expected}, found {actual}");
+    }
+    Ok(())
+}
+
+fn validate_expected_digest(expected: &str) -> Result<()> {
+    if expected.len() != 64 || !expected.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("expected_blake3 must be a 64-character hexadecimal digest");
+    }
+    Ok(())
+}
+
+async fn hash_file(path: &Path) -> Result<String> {
+    let mut file = fs::File::open(path).await?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hasher.finalize().to_hex().to_string())
+}
+
+fn mutation_value(
+    path: &str,
+    metadata: Option<std::fs::Metadata>,
+    blake3: Option<String>,
+) -> Result<WorkspaceValue> {
+    Ok(WorkspaceValue::Mutation {
+        path: path.to_owned(),
+        metadata: metadata.as_ref().map(workspace_metadata),
+        blake3,
+    })
+}
+
+#[cfg(unix)]
+fn permission_mode(metadata: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.mode() & 0o777)
+}
+
+#[cfg(not(unix))]
+fn permission_mode(_metadata: &std::fs::Metadata) -> Option<u32> {
+    None
+}
+
+#[cfg(unix)]
+async fn set_permissions(path: &Path, mode: u32) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).await?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+async fn set_permissions(_path: &Path, _mode: u32) -> Result<()> {
+    Ok(())
+}
+
+async fn sync_directory(path: &Path) -> Result<()> {
+    let path = path.to_owned();
+    tokio::task::spawn_blocking(move || FileSync::sync(path))
+        .await
+        .map_err(|error| anyhow!("directory sync task failed: {error}"))??;
+    Ok(())
+}
+
+struct FileSync;
+
+impl FileSync {
+    fn sync(path: PathBuf) -> std::io::Result<()> {
+        std::fs::File::open(path)?.sync_all()
+    }
+}
+
 fn validate_relative(path: &str) -> Result<PathBuf> {
     let path = if path.is_empty() { "." } else { path };
     let mut result = PathBuf::new();
@@ -298,26 +572,6 @@ fn validate_relative(path: &str) -> Result<PathBuf> {
         }
     }
     Ok(result)
-}
-
-async fn read_bounded<R>(mut reader: R) -> Result<(Vec<u8>, bool)>
-where
-    R: AsyncRead + Unpin,
-{
-    let mut output = Vec::new();
-    let mut truncated = false;
-    let mut buffer = [0_u8; 16 * 1024];
-    loop {
-        let read = reader.read(&mut buffer).await?;
-        if read == 0 {
-            break;
-        }
-        let remaining = MAX_EXEC_OUTPUT_PER_STREAM.saturating_sub(output.len());
-        let keep = remaining.min(read);
-        output.extend_from_slice(&buffer[..keep]);
-        truncated |= keep < read;
-    }
-    Ok((output, truncated))
 }
 
 fn workspace_metadata(metadata: &std::fs::Metadata) -> WorkspaceMetadata {
@@ -384,7 +638,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_hashes_lists_and_executes_inside_workspace() {
+    async fn reads_hashes_and_lists_inside_workspace() {
         let temporary = tempfile::tempdir().unwrap();
         tokio::fs::write(temporary.path().join("alpha.txt"), b"abcdef")
             .await
@@ -442,33 +696,115 @@ mod tests {
             }
             _ => panic!("unexpected hash response"),
         }
+    }
 
-        let exec = workspace
-            .perform(WorkspaceOperation::Exec {
-                argv: vec![
-                    "sh".to_owned(),
-                    "-c".to_owned(),
-                    "printf %s \"$PWD\"".to_owned(),
-                ],
-                cwd: ".".to_owned(),
-                env: Vec::new(),
+    #[tokio::test]
+    async fn atomically_writes_edits_and_detects_conflicts() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceRoot::open(temporary.path()).await.unwrap();
+        let created = workspace
+            .perform(WorkspaceOperation::Write {
+                path: "notes.txt".to_owned(),
+                data_base64: BASE64.encode(b"alpha beta"),
+                expected_blake3: None,
+                overwrite: false,
+                mode: Some(0o640),
             })
             .await
             .unwrap();
-        match exec {
-            WorkspaceValue::Exec {
-                exit_code,
-                stdout_base64,
+        let digest = match created {
+            WorkspaceValue::Mutation {
+                blake3: Some(digest),
                 ..
-            } => {
-                assert_eq!(exit_code, Some(0));
-                assert_eq!(
-                    BASE64.decode(stdout_base64).unwrap(),
-                    temporary.path().as_os_str().as_encoded_bytes()
-                );
-            }
-            _ => panic!("unexpected exec response"),
-        }
+            } => digest,
+            _ => panic!("unexpected write response"),
+        };
+        assert_eq!(
+            tokio::fs::read(temporary.path().join("notes.txt"))
+                .await
+                .unwrap(),
+            b"alpha beta"
+        );
+
+        let conflict = workspace
+            .perform(WorkspaceOperation::Write {
+                path: "notes.txt".to_owned(),
+                data_base64: BASE64.encode(b"unsafe overwrite"),
+                expected_blake3: None,
+                overwrite: false,
+                mode: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(conflict.to_string().contains("already exists"));
+
+        workspace
+            .perform(WorkspaceOperation::Edit {
+                path: "notes.txt".to_owned(),
+                old_text: "beta".to_owned(),
+                new_text: "gamma".to_owned(),
+                expected_blake3: Some(digest.clone()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::fs::read(temporary.path().join("notes.txt"))
+                .await
+                .unwrap(),
+            b"alpha gamma"
+        );
+
+        let stale = workspace
+            .perform(WorkspaceOperation::Edit {
+                path: "notes.txt".to_owned(),
+                old_text: "gamma".to_owned(),
+                new_text: "delta".to_owned(),
+                expected_blake3: Some(digest),
+            })
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("write conflict"));
+    }
+
+    #[tokio::test]
+    async fn creates_renames_and_removes_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let workspace = WorkspaceRoot::open(temporary.path()).await.unwrap();
+        workspace
+            .perform(WorkspaceOperation::Mkdir {
+                path: "a/b".to_owned(),
+                recursive: true,
+            })
+            .await
+            .unwrap();
+        tokio::fs::write(temporary.path().join("a/b/file"), b"x")
+            .await
+            .unwrap();
+        workspace
+            .perform(WorkspaceOperation::Rename {
+                from: "a/b/file".to_owned(),
+                to: "a/b/renamed".to_owned(),
+                overwrite: false,
+            })
+            .await
+            .unwrap();
+        workspace
+            .perform(WorkspaceOperation::Remove {
+                path: "a".to_owned(),
+                recursive: true,
+            })
+            .await
+            .unwrap();
+        assert!(!temporary.path().join("a").exists());
+        assert!(
+            workspace
+                .perform(WorkspaceOperation::Remove {
+                    path: ".".to_owned(),
+                    recursive: true,
+                })
+                .await
+                .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -482,6 +818,18 @@ mod tests {
         let workspace = WorkspaceRoot::open(workspace_dir.path()).await.unwrap();
         let error = workspace.resolve_existing("escape").await.unwrap_err();
         assert!(error.to_string().contains("escapes the workspace root"));
+
+        let write_error = workspace
+            .perform(WorkspaceOperation::Write {
+                path: "escape".to_owned(),
+                data_base64: BASE64.encode(b"do not escape"),
+                expected_blake3: None,
+                overwrite: true,
+                mode: None,
+            })
+            .await
+            .unwrap_err();
+        assert!(write_error.to_string().contains("symlinked"));
 
         let stat = workspace
             .perform(WorkspaceOperation::Stat {

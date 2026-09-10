@@ -8,9 +8,13 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
+serde_json.workspace = true
+sshai-ai = { path = "../sshai-ai" }
 sshai-core = { path = "../sshai-core" }
 sshai-agent = { path = "../sshai-agent" }
+sshai-mcp = { path = "../sshai-mcp" }
 sshai-ssh = { path = "../sshai-ssh" }
+tempfile.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -1,7 +1,13 @@
-use std::{path::PathBuf, process::ExitCode};
+use std::{
+    io::{IsTerminal, Read, Write},
+    path::PathBuf,
+    process::ExitCode,
+};
 
 use anyhow::{Context, Result};
-use clap::{ArgAction, Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
+use serde_json::{Map, Value};
+use sshai_ai::{AgentSession, AgentUi, OpenAiProvider};
 use sshai_core::Target;
 use sshai_ssh::{
     ConnectOptions, HostKeyPolicy, KeyInstallResult, MAX_WORKSPACE_READ, SshConnector,
@@ -14,7 +20,9 @@ use tracing_subscriber::EnvFilter;
 #[command(
     name = "sshai",
     version,
-    about = "A future-facing, pure-Rust SSH workspace transport for local AI tools"
+    about = "A future-facing, pure-Rust SSH workspace transport for local AI tools",
+    arg_required_else_help = true,
+    args_conflicts_with_subcommands = true
 )]
 struct Cli {
     /// OpenSSH-compatible user configuration file.
@@ -41,22 +49,20 @@ struct Cli {
     #[arg(short, long, global = true, action = ArgAction::Count)]
     verbose: u8,
 
+    /// `host`, `user@host:/path`, or `ssh://user@host:port/path` for an interactive shell.
+    #[arg(value_name = "TARGET")]
+    target: Option<Target>,
+
+    /// Disable the per-session remote agent and its built-in commands.
+    #[arg(long)]
+    no_agent: bool,
+
     #[command(subcommand)]
-    command: Command,
+    command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Open an interactive remote shell with PTY support.
-    Ssh {
-        /// `host`, `user@host:/path`, or `ssh://user@host:port/path`.
-        target: Target,
-
-        /// Disable the per-session remote agent and its built-in commands.
-        #[arg(long)]
-        no_agent: bool,
-    },
-
     /// Execute a command remotely and stream stdout/stderr.
     #[command(trailing_var_arg = true)]
     Exec {
@@ -86,6 +92,50 @@ enum Command {
         operation: WorkspaceOperation,
     },
 
+    /// Serve the remote workspace as a local stdio MCP server.
+    Mcp {
+        /// `host`, `user@host:/path`, or `ssh://user@host:port/path`.
+        target: Target,
+    },
+
+    /// Run sshai's built-in local AI agent against a remote workspace.
+    #[command(trailing_var_arg = true)]
+    Agent {
+        /// `host`, `user@host:/path`, or `ssh://user@host:port/path`.
+        target: Target,
+
+        /// Responses API model (or set OPENAI_MODEL).
+        #[arg(long)]
+        model: Option<String>,
+
+        /// OpenAI-compatible API base URL (or set OPENAI_BASE_URL).
+        #[arg(long)]
+        api_base: Option<String>,
+
+        /// Approval policy for remote mutations and command execution.
+        #[arg(long, value_enum, default_value_t = ApprovalArg::Ask)]
+        approval: ApprovalArg,
+
+        /// Maximum remote tool calls in one user turn.
+        #[arg(long, default_value_t = 24)]
+        max_tool_calls: usize,
+
+        /// A one-shot prompt. Omit it to open an interactive conversation.
+        #[arg(allow_hyphen_values = true)]
+        prompt: Vec<String>,
+    },
+
+    /// Launch the locally authenticated Codex CLI against a remote workspace.
+    #[command(trailing_var_arg = true)]
+    Codex {
+        /// `host`, `user@host:/path`, or `ssh://user@host:port/path`.
+        target: Target,
+
+        /// Arguments forwarded to the local Codex CLI.
+        #[arg(allow_hyphen_values = true)]
+        arguments: Vec<String>,
+    },
+
     /// Install local public keys in the remote user's authorized_keys.
     CopyId {
         /// `host`, `user@host`, or `ssh://user@host:port`.
@@ -110,11 +160,11 @@ enum Command {
         config_only: bool,
     },
 
-    /// Internal remote-agent entry points.
+    /// Internal remote-worker entry points.
     #[command(hide = true)]
-    Agent {
+    Worker {
         #[command(subcommand)]
-        operation: AgentOperation,
+        operation: WorkerOperation,
     },
 }
 
@@ -181,7 +231,7 @@ enum WorkspaceOperation {
 }
 
 #[derive(Debug, Subcommand)]
-enum AgentOperation {
+enum WorkerOperation {
     #[command(hide = true)]
     Serve {
         #[arg(long)]
@@ -203,6 +253,67 @@ enum AgentOperation {
     },
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum ApprovalArg {
+    /// Ask before every remote mutation or command execution.
+    Ask,
+    /// Automatically approve remote mutations and command execution.
+    Auto,
+    /// Allow only read-only workspace tools.
+    ReadOnly,
+}
+
+struct TerminalAgentUi {
+    approval: ApprovalArg,
+}
+
+impl AgentUi for TerminalAgentUi {
+    fn tool_started(&mut self, name: &str, arguments: &Map<String, Value>) {
+        let arguments = serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_owned());
+        eprintln!("→ {name} {arguments}");
+    }
+
+    fn approve(&mut self, name: &str, _arguments: &Map<String, Value>) -> Result<bool> {
+        match self.approval {
+            ApprovalArg::Auto => Ok(true),
+            ApprovalArg::ReadOnly => {
+                eprintln!("  denied by --approval read-only");
+                Ok(false)
+            }
+            ApprovalArg::Ask if !std::io::stdin().is_terminal() => {
+                eprintln!("  denied because approval requires an interactive terminal");
+                Ok(false)
+            }
+            ApprovalArg::Ask => {
+                eprint!("  approve {name}? [y/N] ");
+                std::io::stderr().flush()?;
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer)?;
+                Ok(matches!(
+                    answer.trim().to_ascii_lowercase().as_str(),
+                    "y" | "yes"
+                ))
+            }
+        }
+    }
+
+    fn tool_finished(&mut self, _name: &str, result: &Value, failed: bool) {
+        if failed {
+            let message = result
+                .get("error")
+                .and_then(Value::as_str)
+                .unwrap_or("tool failed");
+            eprintln!("  ✗ {message}");
+        } else if let Some(exit) = result.get("exit_code") {
+            eprintln!("  ✓ exit {exit}");
+        } else if let Some(path) = result.get("path").and_then(Value::as_str) {
+            eprintln!("  ✓ {path}");
+        } else {
+            eprintln!("  ✓");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -219,9 +330,20 @@ async fn main() -> ExitCode {
 
 async fn run(cli: Cli) -> Result<u8> {
     let host_key_policy = requested_host_key_policy(&cli);
+    let launch_config = cli.config.clone();
+    let launch_flags = LaunchFlags {
+        strict_host_key: cli.strict_host_key,
+        accept_new: cli.accept_new,
+        insecure: cli.insecure,
+        batch: cli.batch,
+        verbose: cli.verbose,
+    };
     let command = cli.command;
-    if let Command::Agent { operation } = command {
-        return run_agent(operation).await;
+    if let Some(Command::Worker { operation }) = command {
+        return run_worker(operation).await;
+    }
+    if let Some(Command::Codex { target, arguments }) = command {
+        return run_codex(target, arguments, launch_config, launch_flags).await;
     }
 
     let options = ConnectOptions {
@@ -231,17 +353,19 @@ async fn run(cli: Cli) -> Result<u8> {
     };
     let connector = SshConnector::new(options).context("failed to initialize SSH")?;
 
+    if let Some(target) = cli.target {
+        let session = connector.connect(&target).await?;
+        let exit = if cli.no_agent {
+            session.interactive_shell().await?
+        } else {
+            session.interactive_shell_with_agent().await?
+        };
+        session.disconnect().await?;
+        return Ok(exit_code(exit.code, exit.signal.as_deref()));
+    }
+
+    let command = command.expect("clap requires either TARGET or a subcommand");
     match command {
-        Command::Ssh { target, no_agent } => {
-            let session = connector.connect(&target).await?;
-            let exit = if no_agent {
-                session.interactive_shell().await?
-            } else {
-                session.interactive_shell_with_agent().await?
-            };
-            session.disconnect().await?;
-            Ok(exit_code(exit.code, exit.signal.as_deref()))
-        }
         Command::Exec { target, command } => {
             let session = connector.connect(&target).await?;
             let exit = session.exec(&command).await?;
@@ -275,6 +399,42 @@ async fn run(cli: Cli) -> Result<u8> {
             let close_result = workspace.close().await;
             let disconnect_result = session.disconnect().await;
             let code = operation_result?;
+            close_result?;
+            disconnect_result?;
+            Ok(code)
+        }
+        Command::Mcp { target } => {
+            let session = connector.connect(&target).await?;
+            let workspace = session.workspace().await?;
+            let serve_result = sshai_mcp::serve(workspace).await;
+            let disconnect_result = session.disconnect().await;
+            serve_result?;
+            disconnect_result?;
+            Ok(0)
+        }
+        Command::Agent {
+            target,
+            model,
+            api_base,
+            approval,
+            max_tool_calls,
+            prompt,
+        } => {
+            let session = connector.connect(&target).await?;
+            let mut workspace = session.workspace().await?;
+            let agent_result = run_builtin_agent(
+                &mut workspace,
+                &target,
+                model,
+                api_base,
+                approval,
+                max_tool_calls,
+                prompt,
+            )
+            .await;
+            let close_result = workspace.close().await;
+            let disconnect_result = session.disconnect().await;
+            let code = agent_result?;
             close_result?;
             disconnect_result?;
             Ok(code)
@@ -358,13 +518,187 @@ async fn run(cli: Cli) -> Result<u8> {
             }
             Ok(0)
         }
-        Command::Agent { .. } => unreachable!("agent command handled before SSH initialization"),
+        Command::Worker { .. } => unreachable!("worker command handled before SSH initialization"),
+        Command::Codex { .. } => unreachable!("Codex command handled before SSH initialization"),
     }
 }
 
-async fn run_agent(operation: AgentOperation) -> Result<u8> {
+#[derive(Clone, Copy)]
+struct LaunchFlags {
+    strict_host_key: bool,
+    accept_new: bool,
+    insecure: bool,
+    batch: bool,
+    verbose: u8,
+}
+
+async fn run_codex(
+    target: Target,
+    arguments: Vec<String>,
+    config: Option<PathBuf>,
+    flags: LaunchFlags,
+) -> Result<u8> {
+    let executable = std::env::current_exe().context("cannot locate the sshai executable")?;
+    let temporary = tempfile::Builder::new()
+        .prefix("sshai-codex-")
+        .tempdir()
+        .context("cannot create the local Codex bridge directory")?;
+    let instructions = format!(
+        "# Remote sshai workspace\n\n\
+This local directory is only a control shell for the remote workspace `{target}`.\n\
+Do not inspect, create, edit, delete, or execute project files with local filesystem or shell tools.\n\
+Use the `sshai` MCP tools for every project operation:\n\
+- use `workspace_list`, `workspace_stat`, `workspace_read`, and `workspace_hash` to inspect files;\n\
+- use `workspace_write`, `workspace_edit`, `workspace_mkdir`, `workspace_rename`, and `workspace_remove` to modify files;\n\
+- use `workspace_exec` for every shell, Git, build, test, formatter, and package-manager command.\n\
+All paths passed to these tools are relative to the remote workspace root.\n\
+Read relevant remote instruction files such as AGENTS.md before making changes.\n"
+    );
+    std::fs::write(temporary.path().join("AGENTS.md"), instructions)?;
+
+    let mcp_arguments = sshai_mcp_arguments(&target, config.as_deref(), flags);
+    let command_override = format!(
+        "mcp_servers.sshai.command={}",
+        serde_json::to_string(&executable.to_string_lossy())?
+    );
+    let args_override = format!(
+        "mcp_servers.sshai.args={}",
+        serde_json::to_string(&mcp_arguments)?
+    );
+
+    let mut command = tokio::process::Command::new("codex");
+    command
+        .arg("-C")
+        .arg(temporary.path())
+        .arg("--sandbox")
+        .arg("read-only")
+        .arg("-c")
+        .arg(command_override)
+        .arg("-c")
+        .arg(args_override)
+        .arg("-c")
+        .arg("mcp_servers.sshai.startup_timeout_sec=120")
+        .arg("-c")
+        .arg("mcp_servers.sshai.tool_timeout_sec=330")
+        .arg("-c")
+        .arg("mcp_servers.sshai.required=true")
+        .arg("-c")
+        .arg("mcp_servers.sshai.default_tools_approval_mode=\"writes\"")
+        .args(arguments)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .kill_on_drop(true);
+    let status = command
+        .status()
+        .await
+        .context("cannot launch the local Codex CLI; ensure `codex` is in PATH")?;
+    Ok(status
+        .code()
+        .map(|code| u8::try_from(code.clamp(0, 255)).unwrap_or(255))
+        .unwrap_or(128))
+}
+
+fn sshai_mcp_arguments(
+    target: &Target,
+    config: Option<&std::path::Path>,
+    flags: LaunchFlags,
+) -> Vec<String> {
+    let mut arguments = Vec::new();
+    if let Some(config) = config {
+        arguments.push("-F".to_owned());
+        arguments.push(config.to_string_lossy().into_owned());
+    }
+    if flags.strict_host_key {
+        arguments.push("--strict-host-key".to_owned());
+    }
+    if flags.accept_new {
+        arguments.push("--accept-new".to_owned());
+    }
+    if flags.insecure {
+        arguments.push("--insecure".to_owned());
+    }
+    if flags.batch {
+        arguments.push("--batch".to_owned());
+    }
+    for _ in 0..flags.verbose {
+        arguments.push("-v".to_owned());
+    }
+    arguments.push("mcp".to_owned());
+    arguments.push(target.to_string());
+    arguments
+}
+
+async fn run_builtin_agent(
+    workspace: &mut WorkspaceClient,
+    target: &Target,
+    model: Option<String>,
+    api_base: Option<String>,
+    approval: ApprovalArg,
+    max_tool_calls: usize,
+    prompt: Vec<String>,
+) -> Result<u8> {
+    let api_key = std::env::var("OPENAI_API_KEY").context(
+        "the built-in agent requires local OPENAI_API_KEY; it is never sent to the remote host",
+    )?;
+    let model = model
+        .or_else(|| std::env::var("OPENAI_MODEL").ok())
+        .unwrap_or_else(|| "gpt-5.4-mini".to_owned());
+    let api_base = api_base
+        .or_else(|| std::env::var("OPENAI_BASE_URL").ok())
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_owned());
+    let provider = OpenAiProvider::new(api_key, model, &api_base)?;
+    let model_name = provider.model().to_owned();
+    let mut agent = AgentSession::new(provider, max_tool_calls)?;
+    let (root, _) = workspace.open().await?;
+    let mut ui = TerminalAgentUi { approval };
+
+    if !prompt.is_empty() {
+        let answer = agent.run_turn(workspace, prompt.join(" "), &mut ui).await?;
+        println!("{answer}");
+        return Ok(0);
+    }
+
+    if !std::io::stdin().is_terminal() {
+        let mut input = String::new();
+        std::io::stdin().read_to_string(&mut input)?;
+        let answer = agent.run_turn(workspace, input, &mut ui).await?;
+        println!("{answer}");
+        return Ok(0);
+    }
+
+    eprintln!("sshai agent · {model_name} · {target} · {root}");
+    eprintln!("Commands: /clear, /help, /exit");
+    loop {
+        eprint!("> ");
+        std::io::stderr().flush()?;
+        let mut input = String::new();
+        if std::io::stdin().read_line(&mut input)? == 0 {
+            break;
+        }
+        let input = input.trim();
+        match input {
+            "" => continue,
+            "/exit" | "/quit" => break,
+            "/clear" => {
+                agent.clear();
+                eprintln!("conversation cleared");
+            }
+            "/help" => eprintln!(
+                "Enter a request for the remote workspace. /clear resets model context; /exit closes the SSH session."
+            ),
+            prompt => match agent.run_turn(workspace, prompt, &mut ui).await {
+                Ok(answer) => println!("{answer}"),
+                Err(error) => eprintln!("agent: {error:#}"),
+            },
+        }
+    }
+    Ok(0)
+}
+
+async fn run_worker(operation: WorkerOperation) -> Result<u8> {
     match operation {
-        AgentOperation::Serve {
+        WorkerOperation::Serve {
             session_id,
             session_dir,
             workspace_root,
@@ -377,7 +711,7 @@ async fn run_agent(operation: AgentOperation) -> Result<u8> {
             .await?;
             Ok(0)
         }
-        AgentOperation::Invoke {
+        WorkerOperation::Invoke {
             session_id,
             socket,
             argv,
@@ -531,5 +865,44 @@ fn exit_code(code: Option<u32>, signal: Option<&str>) -> u8 {
         Some(code) => u8::try_from(code.min(255)).unwrap_or(255),
         None if signal.is_some() => 128,
         None => 255,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_bare_target_as_the_interactive_shell() {
+        let cli = Cli::try_parse_from(["sshai", "ka@ka2", "-v", "--no-agent"]).unwrap();
+
+        assert_eq!(cli.target.unwrap().to_string(), "ka@ka2");
+        assert!(cli.command.is_none());
+        assert_eq!(cli.verbose, 1);
+        assert!(cli.no_agent);
+    }
+
+    #[test]
+    fn still_recognizes_named_subcommands() {
+        let cli = Cli::try_parse_from(["sshai", "doctor", "ka@ka2", "--config-only"]).unwrap();
+
+        assert!(cli.target.is_none());
+        assert!(matches!(
+            cli.command,
+            Some(Command::Doctor {
+                target: Some(_),
+                config_only: true
+            })
+        ));
+    }
+
+    #[test]
+    fn rejects_the_removed_ssh_subcommand_form() {
+        assert!(Cli::try_parse_from(["sshai", "ssh", "ka@ka2"]).is_err());
+    }
+
+    #[test]
+    fn rejects_mixing_a_target_with_a_subcommand() {
+        assert!(Cli::try_parse_from(["sshai", "ka@ka2", "exec", "true"]).is_err());
     }
 }

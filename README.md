@@ -15,6 +15,9 @@
 - 纯 Rust `copy-id`，幂等维护远端 `authorized_keys`
 - 默认启用按会话隔离的远端 agent、Unix socket 和 `sshai` shim
 - 独立 SSH 控制 Channel，远端内置命令同步调用本地能力
+- 本地 stdio MCP Server，将远端工作区暴露给 AI CLI
+- `sshai codex` 一次性注入 MCP 配置，本地 Codex 登录态无需迁移
+- `sshai agent` 内置本地模型循环，共用 MCP 的远程工具与审批边界
 - `doctor` 配置与连接诊断
 
 ## 构建
@@ -42,9 +45,9 @@ cargo install --path crates/sshai-cli --force
 打开远程 Shell：
 
 ```bash
-sshai ssh dev-server
-sshai ssh user@example.com:/srv/project
-sshai ssh ssh://user@example.com:2222/srv/project
+sshai dev-server
+sshai user@example.com:/srv/project
+sshai ssh://user@example.com:2222/srv/project
 ```
 
 交互式 Shell 默认会：
@@ -64,7 +67,20 @@ sshai copy-id
 sshai copy-id -i '~/.ssh/id_ed25519.pub'
 ```
 
-`-i` 指向的是本机文件；请像上例一样引用 `~`，避免它先被远端 Shell 展开。请求通过独立的加密 SSH Channel 传输，不解析或匹配终端输入字符。若要连接不支持 agent 的主机，可显式使用 `sshai ssh --no-agent HOST`。
+`-i` 指向的是本机文件；请像上例一样引用 `~`，避免它先被远端 Shell 展开。请求通过独立的加密 SSH Channel 传输，不解析或匹配终端输入字符。若要连接不支持 agent 的主机，可显式使用 `sshai --no-agent HOST`。
+
+连接较慢时使用 `-v` 可查看 TCP、SSH 握手、认证、SFTP 缓存校验及远端 agent 启动各阶段的毫秒耗时；`-vv` 还会开启底层 SSH 库的 debug 日志：
+
+```bash
+sshai dev-server -v
+sshai dev-server -vv
+```
+
+若只需要普通远程 Shell，不需要会话内置命令，可使用 `--no-agent` 跳过平台检测、SFTP 校验和 agent 启动，连接时延会更接近系统 `ssh`：
+
+```bash
+sshai --no-agent dev-server
+```
 
 通过 Workspace RPC 检查远端工作区：
 
@@ -83,6 +99,53 @@ sshai workspace dev-server:/srv/project exec --pty --shell -- 'ls'
 `list/stat/read/hash` 只能访问工作区根目录内的相对路径；绝对路径、`..` 和指向根目录外的符号链接都会被拒绝。`list` 使用稳定的名称游标分页，`read` 每次最多读取 512 KiB。
 
 Workspace `exec` 默认直接使用 argv 启动进程，不经过 Shell，以独立 stdout/stderr 事件实时返回，适合 AI 和脚本。`--pty` 会分配远端伪终端、转发 stdin、`TERM`、窗口尺寸、resize 和终端信号，适合颜色、列布局和交互程序；PTY 中 stdout/stderr 按终端语义合流。`--shell` 要求一个完整命令字符串，并通过远端登录 Shell 执行，以显式启用 alias、管道和重定向。执行工作目录必须位于工作区内，但进程仍拥有远端 SSH 用户本身的权限。命令有 300 秒超时，SSH/Agent 断开会终止整个远端进程组。
+
+## 本地 AI 操作远端工作区
+
+直接启动本机已经登录的 Codex CLI：
+
+```bash
+sshai codex dev-server:/srv/project
+sshai codex dev-server:/srv/project -- "修复测试并在远端运行 cargo test"
+sshai codex dev-server:/srv/project -- exec "检查这个项目的错误处理"
+```
+
+`sshai codex` 不复制或修改 Codex 登录凭据，也不持久修改 `~/.codex/config.toml`。它创建一个会话级本地壳目录，通过命令行配置注入 `sshai` stdio MCP，并强制本地 Codex sandbox 为只读。Codex 的项目读取、写入、Git、构建和测试由 MCP 工具发送到远端 Agent；会话结束后壳目录自动删除。
+
+也可以把 MCP Server 接入其他兼容客户端：
+
+```bash
+sshai mcp dev-server:/srv/project
+```
+
+MCP 提供 `workspace_info/list/stat/read/hash/write/edit/mkdir/rename/remove/exec`。写文件使用同目录临时文件、`fsync` 和原子 rename；编辑会自动以读取内容的 BLAKE3 作为乐观并发条件。覆盖现有文件必须提供 `expected_blake3` 或显式设置 `overwrite=true`。
+
+stdio MCP 的 stdin/stdout 专用于 JSON-RPC，不能用于 SSH 密码交互。建议先运行 `sshai copy-id HOST` 配置公钥认证。
+
+运行 sshai 自己的内置 Agent：
+
+```bash
+export OPENAI_API_KEY=...
+
+# 交互会话
+sshai agent dev-server:/srv/project
+
+# 单次任务
+sshai agent dev-server:/srv/project -- "修复失败的测试并验证"
+
+# 自动批准远端命令和修改，适合受控的开发机
+sshai agent dev-server:/srv/project --approval auto -- "运行测试并修复问题"
+```
+
+内置 Agent 在本地调用 Responses API，模型凭证不会进入 SSH 通道或远端主机。默认模型是 `gpt-5.4-mini`；可以使用 `--model` 或 `OPENAI_MODEL` 修改。默认 API 地址是 `https://api.openai.com/v1`；兼容服务可以通过 `--api-base` 或 `OPENAI_BASE_URL` 指定，非本机地址必须使用 HTTPS。
+
+审批策略包括：
+
+- `ask`（默认）：读取自动执行，写入、删除和命令执行逐次确认；
+- `auto`：自动批准所有远程工具；
+- `read-only`：拒绝一切写入和命令执行。
+
+交互模式支持 `/clear` 清空模型上下文和 `/exit` 结束会话。MCP 与内置 Agent 都使用 `sshai-tools` 中同一份工具 schema 和 dispatcher，避免两种入口产生不同的远端行为。当前模型输出按完整 response 返回；模型文本和远程命令输出的增量展示将在后续版本加入。
 
 在远程工作区执行命令：
 
@@ -167,7 +230,8 @@ ServerAliveCountMax
 - 加密私钥和密码只在内存中短暂存在。
 - SFTP 默认拒绝覆盖；覆盖必须显式传入 `--force`。
 - agent 控制协议使用带长度上限的版本化帧；每个 shim 请求都校验随机会话令牌。
-- Workspace RPC 使用独立 request/process ID 和结构化错误，支持 `open/list/stat/read/hash` 以及流式 pipe/PTY exec。
+- Workspace RPC v3 使用独立 request/process ID 和结构化错误，支持读取、原子写入、唯一文本编辑、目录操作以及流式 pipe/PTY exec。
+- MCP 写入工具提供保守的 destructive/read-only annotations，交由 AI 客户端执行审批。
 - shim 只存在于当前会话的 `PATH`，socket 为 `0600`，会话目录为 `0700`。
 - 缓存 agent 在执行前通过 SFTP 流式 SHA-256 校验，上传后再次校验。
 
@@ -175,6 +239,6 @@ ServerAliveCountMax
 
 当前 agent 要求远端为 Unix，且远端 OS/CPU 能运行本地构建出的同一二进制。Linux 跨发行版发布建议使用静态 musl 构建；未来可在 bootstrap 层按远端平台选择签名发布产物。
 
-这一版已经建立可靠的 agent/shim 控制平面。文件增量同步和 Codex/Claude/Gemini 适配器可继续建立在同一版本化协议上。
+这一版已经建立可靠的 agent/shim 控制平面、Workspace RPC、共享工具层、stdio MCP、Codex 适配器和 sshai 内置 AI Agent。Claude/Gemini 适配器、模型流式输出以及文件 watch/增量同步可继续建立在同一工具层和版本化协议上。
 
 详细设计见 [docs/architecture.md](docs/architecture.md)。

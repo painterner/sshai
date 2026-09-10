@@ -340,7 +340,7 @@ mod unix {
         session_id: &str,
     ) -> Result<()> {
         let script = format!(
-            "#!/bin/sh\nexec {} agent invoke --session-id {} --socket {} -- \"$@\"\n",
+            "#!/bin/sh\nexec {} worker invoke --session-id {} --socket {} -- \"$@\"\n",
             shell_quote(&executable.to_string_lossy()),
             shell_quote(session_id),
             shell_quote(&socket.to_string_lossy()),
