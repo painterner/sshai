@@ -1,0 +1,27 @@
+[package]
+name = "sshai-ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+dirs.workspace = true
+hex.workspace = true
+nix.workspace = true
+rpassword.workspace = true
+russh.workspace = true
+russh-sftp.workspace = true
+secrecy.workspace = true
+sha2.workspace = true
+sshai-core = { path = "../sshai-core" }
+sshai-protocol = { path = "../sshai-protocol" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

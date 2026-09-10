@@ -1,0 +1,20 @@
+[package]
+name = "sshai"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+sshai-core = { path = "../sshai-core" }
+sshai-agent = { path = "../sshai-agent" }
+sshai-ssh = { path = "../sshai-ssh" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[[bin]]
+name = "sshai"
+path = "src/main.rs"
