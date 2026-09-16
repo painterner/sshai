@@ -51,7 +51,7 @@ impl WorkspaceRoot {
     }
 
     pub(crate) fn capabilities() -> Vec<String> {
-        [
+        let mut capabilities = [
             "open",
             "list",
             "stat",
@@ -70,7 +70,14 @@ impl WorkspaceRoot {
         ]
         .into_iter()
         .map(str::to_owned)
-        .collect()
+        .collect::<Vec<_>>();
+        capabilities.push(format!("environment.os={}", std::env::consts::OS));
+        capabilities.push(format!("environment.arch={}", std::env::consts::ARCH));
+        capabilities.push(format!("environment.family={}", std::env::consts::FAMILY));
+        if let Ok(shell) = std::env::var("SHELL") {
+            capabilities.push(format!("environment.shell={shell}"));
+        }
+        capabilities
     }
 
     pub(crate) async fn handle(&self, request: WorkspaceRequest) -> WorkspaceResponse {

@@ -126,7 +126,21 @@ pub async fn dispatch(
     match name {
         "workspace_info" => {
             let (root, capabilities) = workspace.open().await?;
-            Ok(json!({"root": root, "capabilities": capabilities}))
+            let environment = capabilities
+                .iter()
+                .filter_map(|capability| {
+                    capability
+                        .strip_prefix("environment.")
+                        .and_then(|value| value.split_once('='))
+                })
+                .map(|(key, value)| (key.to_owned(), Value::String(value.to_owned())))
+                .collect::<Map<_, _>>();
+            Ok(json!({
+                "location": "remote",
+                "root": root,
+                "environment": environment,
+                "capabilities": capabilities,
+            }))
         }
         "workspace_list" => {
             let path = optional_string(arguments, "path").unwrap_or_else(|| ".".to_owned());

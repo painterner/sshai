@@ -12,7 +12,6 @@ impl<T> AgentIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 
 pub(crate) struct RemoteAgent {
     io: Box<dyn AgentIo>,
-    pub(crate) shell_launcher: String,
     pub(crate) workspace_root: String,
     pub(crate) capabilities: Vec<String>,
     next_request_id: u64,
@@ -35,7 +34,7 @@ impl RemoteAgent {
                 protocol,
                 session_id,
                 bin_dir: _,
-                shell_launcher,
+                shell_launcher: _,
                 workspace_root,
                 capabilities,
             } => {
@@ -51,7 +50,6 @@ impl RemoteAgent {
                 }
                 Ok(Self {
                     io,
-                    shell_launcher,
                     workspace_root,
                     capabilities,
                     next_request_id: 1,

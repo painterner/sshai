@@ -112,17 +112,32 @@ fn parse_port(port: &str) -> Result<u16, ParseTargetError> {
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.port.is_some() || self.host.contains(':') {
+            f.write_str("ssh://")?;
+            if let Some(user) = &self.user {
+                write!(f, "{user}@")?;
+            }
+            if self.host.contains(':') {
+                write!(f, "[{}]", self.host)?;
+            } else {
+                f.write_str(&self.host)?;
+            }
+            if let Some(port) = self.port {
+                write!(f, ":{port}")?;
+            }
+            if let Some(path) = &self.path {
+                if !path.starts_with('/') {
+                    f.write_str("/")?;
+                }
+                f.write_str(path)?;
+            }
+            return Ok(());
+        }
+
         if let Some(user) = &self.user {
             write!(f, "{user}@")?;
         }
-        if self.host.contains(':') {
-            write!(f, "[{}]", self.host)?;
-        } else {
-            f.write_str(&self.host)?;
-        }
-        if let Some(port) = self.port {
-            write!(f, ":{port}")?;
-        }
+        f.write_str(&self.host)?;
         if let Some(path) = &self.path {
             write!(f, ":{path}")?;
         }
@@ -164,5 +179,16 @@ mod tests {
     fn empty_scp_path_means_remote_home() {
         let target: Target = "example.com:".parse().unwrap();
         assert_eq!(target.path, None);
+    }
+
+    #[test]
+    fn display_round_trips_an_explicit_port_and_ipv6() {
+        for value in [
+            "ssh://alice@example.com:2222/srv/app",
+            "ssh://alice@[2001:db8::1]:2222/srv/app",
+        ] {
+            let target: Target = value.parse().unwrap();
+            assert_eq!(target.to_string().parse::<Target>().unwrap(), target);
+        }
     }
 }

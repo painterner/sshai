@@ -1,5 +1,5 @@
 use std::{
-    path::Path,
+    path::{Component, Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -17,11 +17,19 @@ use crate::{Result, SshError};
 
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const MAX_AUTHORIZED_KEYS_SIZE: u64 = 16 * 1024 * 1024;
+const MAX_TRANSFER_ENTRIES: u64 = 100_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum KeyInstallResult {
     Installed,
     AlreadyPresent,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SftpTransferStats {
+    pub bytes: u64,
+    pub files: u64,
+    pub directories: u64,
 }
 
 /// A small stable wrapper around `russh-sftp` used for bootstrap transfers.
@@ -99,6 +107,17 @@ impl SftpClient {
     }
 
     pub async fn ensure_dir_all(&self, remote: impl Into<String>, mode: u32) -> Result<()> {
+        let path = self.ensure_directory_components(remote).await?;
+        self.set_permissions(path, mode).await
+    }
+
+    /// Create missing directory components without changing permissions on an existing path.
+    pub async fn create_dir_all(&self, remote: impl Into<String>) -> Result<()> {
+        self.ensure_directory_components(remote).await?;
+        Ok(())
+    }
+
+    async fn ensure_directory_components(&self, remote: impl Into<String>) -> Result<String> {
         let path = self.remote_path(remote.into());
         let absolute = path.starts_with('/');
         let mut current = if absolute {
@@ -133,7 +152,7 @@ impl SftpClient {
                 }
             }
         }
-        self.set_permissions(path, mode).await
+        Ok(path)
     }
 
     pub async fn download(
@@ -226,6 +245,232 @@ impl SftpClient {
             return Err(error.into());
         }
         Ok(copied)
+    }
+
+    pub async fn upload_path(
+        &self,
+        local: impl AsRef<Path>,
+        remote: impl Into<String>,
+        recursive: bool,
+        overwrite: bool,
+        excludes: &[String],
+    ) -> Result<SftpTransferStats> {
+        let local = local.as_ref();
+        ensure_no_local_symlink(local)?;
+        let source = local.canonicalize().map_err(SshError::Io)?;
+        let metadata = std::fs::symlink_metadata(&source).map_err(SshError::Io)?;
+        if metadata.file_type().is_symlink() {
+            return Err(SshError::Config(format!(
+                "refusing to transfer local symlink {}",
+                source.display()
+            )));
+        }
+        let remote = remote.into();
+        if metadata.is_file() {
+            self.ensure_parent_directory(&remote).await?;
+            let bytes = self.upload(&source, remote.clone(), overwrite).await?;
+            self.set_permissions(remote, local_mode(&metadata, false))
+                .await?;
+            return Ok(SftpTransferStats {
+                bytes,
+                files: 1,
+                directories: 0,
+            });
+        }
+        if !metadata.is_dir() {
+            return Err(SshError::Config(
+                "local source is neither a regular file nor a directory".to_owned(),
+            ));
+        }
+        if !recursive {
+            return Err(SshError::Config(
+                "local source is a directory; pass --recursive".to_owned(),
+            ));
+        }
+
+        let mut stats = SftpTransferStats::default();
+        let mut stack = vec![(source, remote, PathBuf::new())];
+        while let Some((local, remote, relative)) = stack.pop() {
+            if transfer_excluded(&relative, excludes) {
+                continue;
+            }
+            ensure_transfer_limit(stats)?;
+            let metadata = std::fs::symlink_metadata(&local).map_err(SshError::Io)?;
+            if metadata.file_type().is_symlink() {
+                return Err(SshError::Config(format!(
+                    "refusing to transfer local symlink {}",
+                    local.display()
+                )));
+            }
+            if metadata.is_dir() {
+                if remote != "." {
+                    self.create_dir_all(remote.clone()).await?;
+                }
+                stats.directories += 1;
+                let mut children = std::fs::read_dir(&local)
+                    .map_err(SshError::Io)?
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .map_err(SshError::Io)?;
+                children.sort_by_key(std::fs::DirEntry::file_name);
+                for child in children.into_iter().rev() {
+                    let name = child.file_name();
+                    stack.push((
+                        child.path(),
+                        join_remote_path(&remote, &name.to_string_lossy()),
+                        relative.join(name),
+                    ));
+                }
+            } else if metadata.is_file() {
+                self.ensure_parent_directory(&remote).await?;
+                stats.bytes += self.upload(&local, remote.clone(), overwrite).await?;
+                self.set_permissions(remote, local_mode(&metadata, false))
+                    .await?;
+                stats.files += 1;
+            } else {
+                return Err(SshError::Config(format!(
+                    "refusing to transfer special local file {}",
+                    local.display()
+                )));
+            }
+        }
+        Ok(stats)
+    }
+
+    pub async fn download_path(
+        &self,
+        remote: impl Into<String>,
+        local: impl AsRef<Path>,
+        recursive: bool,
+        overwrite: bool,
+        excludes: &[String],
+    ) -> Result<SftpTransferStats> {
+        let remote = self.remote_path(remote.into());
+        let local = local.as_ref();
+        ensure_no_local_symlink(local)?;
+        let metadata = self.inner.symlink_metadata(remote.clone()).await?;
+        if metadata.is_symlink() {
+            return Err(SshError::Config(format!(
+                "refusing to transfer remote symlink {remote}"
+            )));
+        }
+        if metadata.is_regular() {
+            ensure_local_parent(local)?;
+            let bytes = self.download(remote, local, overwrite).await?;
+            set_local_permissions(local, metadata.permissions, false)?;
+            return Ok(SftpTransferStats {
+                bytes,
+                files: 1,
+                directories: 0,
+            });
+        }
+        if !metadata.is_dir() {
+            return Err(SshError::Config(
+                "remote source is neither a regular file nor a directory".to_owned(),
+            ));
+        }
+        if !recursive {
+            return Err(SshError::Config(
+                "remote source is a directory; pass --recursive".to_owned(),
+            ));
+        }
+
+        let mut stats = SftpTransferStats::default();
+        let mut stack = vec![(remote, local.to_owned(), PathBuf::new())];
+        while let Some((remote, local, relative)) = stack.pop() {
+            if transfer_excluded(&relative, excludes) {
+                continue;
+            }
+            ensure_transfer_limit(stats)?;
+            ensure_local_directory(&local)?;
+            stats.directories += 1;
+
+            let mut entries = self.inner.read_dir(remote).await?.collect::<Vec<_>>();
+            entries.sort_by_key(|entry| entry.file_name());
+            for entry in entries.into_iter().rev() {
+                let name = entry.file_name();
+                let child_relative = relative.join(&name);
+                if transfer_excluded(&child_relative, excludes) {
+                    continue;
+                }
+                let child_remote = entry.path();
+                let child_local = local.join(&name);
+                let metadata = entry.metadata();
+                if metadata.is_dir() {
+                    stack.push((child_remote, child_local, child_relative));
+                } else if metadata.is_regular() {
+                    ensure_transfer_limit(stats)?;
+                    ensure_local_parent(&child_local)?;
+                    stats.bytes += self.download(child_remote, &child_local, overwrite).await?;
+                    set_local_permissions(&child_local, metadata.permissions, false)?;
+                    stats.files += 1;
+                } else if metadata.is_symlink() {
+                    return Err(SshError::Config(format!(
+                        "refusing to transfer remote symlink {child_remote}"
+                    )));
+                } else {
+                    return Err(SshError::Config(format!(
+                        "refusing to transfer special remote file {child_remote}"
+                    )));
+                }
+            }
+        }
+        Ok(stats)
+    }
+
+    async fn ensure_parent_directory(&self, remote: &str) -> Result<()> {
+        let parent = remote
+            .rsplit_once('/')
+            .map(|(parent, _)| parent)
+            .unwrap_or(".");
+        if parent != "." && !parent.is_empty() {
+            self.create_dir_all(parent.to_owned()).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn upload_bytes(
+        &self,
+        data: &[u8],
+        remote: impl Into<String>,
+        overwrite: bool,
+    ) -> Result<u64> {
+        let remote = self.remote_path(remote.into());
+        if self.inner.try_exists(remote.clone()).await? && !overwrite {
+            return Err(SshError::Config(format!(
+                "remote file {remote} already exists; pass --force to replace it"
+            )));
+        }
+
+        let temporary = format!(
+            "{remote}.sshai-upload-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        );
+        let mut destination = self.inner.create(temporary.clone()).await?;
+        if let Err(error) = destination.write_all(data).await {
+            let _ = destination.close().await;
+            let _ = self.inner.remove_file(temporary.clone()).await;
+            return Err(error.into());
+        }
+        if let Err(error) = destination.flush().await {
+            let _ = destination.close().await;
+            let _ = self.inner.remove_file(temporary.clone()).await;
+            return Err(error.into());
+        }
+        if let Err(error) = destination.sync_all().await {
+            let _ = destination.close().await;
+            let _ = self.inner.remove_file(temporary.clone()).await;
+            return Err(error.into());
+        }
+        destination.close().await?;
+        if overwrite && self.inner.try_exists(remote.clone()).await? {
+            self.inner.remove_file(remote.clone()).await?;
+        }
+        if let Err(error) = self.inner.rename(temporary.clone(), remote).await {
+            let _ = self.inner.remove_file(temporary).await;
+            return Err(error.into());
+        }
+        Ok(data.len() as u64)
     }
 
     pub async fn close(&self) -> Result<()> {
@@ -384,7 +629,111 @@ impl SftpClient {
 }
 
 fn join_remote_path(parent: &str, child: &str) -> String {
-    format!("{}/{}", parent.trim_end_matches('/'), child)
+    if parent == "." || parent.is_empty() {
+        child.to_owned()
+    } else if parent == "/" {
+        format!("/{child}")
+    } else {
+        format!("{}/{}", parent.trim_end_matches('/'), child)
+    }
+}
+
+fn transfer_excluded(relative: &Path, excludes: &[String]) -> bool {
+    if relative.as_os_str().is_empty() {
+        return false;
+    }
+    let normalized = relative
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    excludes.iter().any(|exclude| {
+        let exclude = exclude.trim_matches('/');
+        if exclude.is_empty() {
+            return false;
+        }
+        if exclude.contains('/') {
+            let path = normalized.join("/");
+            path == exclude || path.starts_with(&format!("{exclude}/"))
+        } else {
+            normalized.iter().any(|component| component == exclude)
+        }
+    })
+}
+
+fn ensure_transfer_limit(stats: SftpTransferStats) -> Result<()> {
+    if stats.files + stats.directories >= MAX_TRANSFER_ENTRIES {
+        return Err(SshError::Config(format!(
+            "transfer exceeds {MAX_TRANSFER_ENTRIES} filesystem entries"
+        )));
+    }
+    Ok(())
+}
+
+fn ensure_no_local_symlink(path: &Path) -> Result<()> {
+    let mut current = PathBuf::new();
+    for component in path.components() {
+        current.push(component);
+        match std::fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(SshError::Config(format!(
+                    "refusing local symlink in transfer path {}",
+                    current.display()
+                )));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+            Err(error) => return Err(SshError::Io(error)),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_local_parent(path: &Path) -> Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        SshError::Config(format!(
+            "local destination {} has no parent",
+            path.display()
+        ))
+    })?;
+    if parent.as_os_str().is_empty() {
+        return Ok(());
+    }
+    ensure_local_directory(parent)
+}
+
+fn ensure_local_directory(path: &Path) -> Result<()> {
+    ensure_no_local_symlink(path)?;
+    std::fs::create_dir_all(path).map_err(SshError::Io)?;
+    ensure_no_local_symlink(path)
+}
+
+#[cfg(unix)]
+fn local_mode(metadata: &std::fs::Metadata, _directory: bool) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode() & 0o777
+}
+
+#[cfg(not(unix))]
+fn local_mode(_metadata: &std::fs::Metadata, directory: bool) -> u32 {
+    if directory { 0o755 } else { 0o644 }
+}
+
+#[cfg(unix)]
+fn set_local_permissions(path: &Path, permissions: Option<u32>, _directory: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(mode) = permissions {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode & 0o777))
+            .map_err(SshError::Io)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_local_permissions(_path: &Path, _permissions: Option<u32>, _directory: bool) -> Result<()> {
+    Ok(())
 }
 
 fn authorized_keys_contains(contents: &str, key_blob: &str) -> bool {
@@ -433,5 +782,39 @@ mod tests {
             &format!("# ssh-ed25519 {BLOB}\nssh-ed25519 other"),
             BLOB
         ));
+    }
+
+    #[test]
+    fn transfer_excludes_names_and_relative_subtrees() {
+        let excludes = vec!["node_modules".to_owned(), "build/cache".to_owned()];
+        assert!(transfer_excluded(
+            Path::new("web/node_modules/pkg"),
+            &excludes
+        ));
+        assert!(transfer_excluded(Path::new("build/cache/item"), &excludes));
+        assert!(!transfer_excluded(Path::new("build/output"), &excludes));
+    }
+
+    #[test]
+    fn remote_path_join_handles_root_and_relative_destinations() {
+        assert_eq!(join_remote_path("/", "file"), "/file");
+        assert_eq!(join_remote_path(".", "file"), "file");
+        assert_eq!(join_remote_path("dir", "file"), "dir/file");
+        assert!(ensure_local_parent(Path::new("file")).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn transfer_rejects_local_symlink_components() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let real = temporary.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = temporary.path().join("link");
+        symlink(&real, &link).unwrap();
+
+        assert!(ensure_no_local_symlink(&link.join("file")).is_err());
+        assert!(ensure_no_local_symlink(&real.join("file")).is_ok());
     }
 }

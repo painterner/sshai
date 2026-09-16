@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-pub const PROTOCOL_VERSION: u16 = 3;
+pub const PROTOCOL_VERSION: u16 = 4;
 pub const MAX_FRAME_SIZE: usize = 1024 * 1024;
 pub const MAX_WORKSPACE_READ: u32 = 512 * 1024;
 
@@ -42,6 +42,7 @@ pub enum ClientToAgent {
 pub struct ControlRequest {
     pub id: u64,
     pub argv: Vec<String>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -57,6 +58,7 @@ pub struct ShimRequest {
     pub protocol: u16,
     pub session_id: String,
     pub argv: Vec<String>,
+    pub cwd: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -348,5 +350,23 @@ mod tests {
         writer.write_u32((MAX_FRAME_SIZE + 1) as u32).await.unwrap();
         let error = read_frame::<_, ShimRequest>(&mut reader).await.unwrap_err();
         assert!(matches!(error, ProtocolError::FrameTooLarge(_)));
+    }
+
+    #[tokio::test]
+    async fn shim_request_carries_the_remote_working_directory() {
+        let (mut writer, mut reader) = tokio::io::duplex(512);
+        let expected = ShimRequest {
+            protocol: PROTOCOL_VERSION,
+            session_id: "0123456789abcdef0123456789abcdef".to_owned(),
+            argv: vec!["codex".to_owned(), "--help".to_owned()],
+            cwd: Some("/srv/project".to_owned()),
+        };
+        let send = tokio::spawn(async move { write_frame(&mut writer, &expected).await });
+        let received: ShimRequest = read_frame(&mut reader).await.unwrap();
+        send.await.unwrap().unwrap();
+
+        assert_eq!(received.protocol, PROTOCOL_VERSION);
+        assert_eq!(received.argv, ["codex", "--help"]);
+        assert_eq!(received.cwd.as_deref(), Some("/srv/project"));
     }
 }

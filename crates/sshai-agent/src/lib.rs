@@ -10,6 +10,7 @@ pub struct ServeOptions {
     pub session_id: String,
     pub session_dir: PathBuf,
     pub workspace_root: PathBuf,
+    pub prepared: bool,
 }
 
 #[cfg(unix)]
@@ -58,23 +59,31 @@ mod unix {
 
     pub async fn serve(options: ServeOptions) -> Result<()> {
         validate_session_id(&options.session_id)?;
-        prepare_session_directory(&options.session_dir).await?;
+        prepare_session_directory(&options.session_dir, options.prepared).await?;
         let mut cleanup_guard = SessionDirectoryGuard(Some(options.session_dir.clone()));
         let workspace = WorkspaceRoot::open(&options.workspace_root).await?;
         let socket_path = options.session_dir.join("agent.sock");
         let bin_dir = options.session_dir.join("bin");
-        tokio::fs::create_dir(&bin_dir).await?;
+        tokio::fs::create_dir_all(&bin_dir).await?;
         set_mode(&bin_dir, 0o700).await?;
 
-        let executable = std::env::current_exe().context("cannot locate remote sshai binary")?;
-        write_shim(
-            &bin_dir.join("sshai"),
-            &executable,
-            &socket_path,
-            &options.session_id,
-        )
-        .await?;
-        let shell_launcher = write_shell_support(&options.session_dir, &bin_dir).await?;
+        let shell_launcher = if options.prepared {
+            let launcher = options.session_dir.join("launch-shell");
+            validate_prepared_file(&launcher)?;
+            validate_prepared_file(&bin_dir.join("sshai"))?;
+            launcher
+        } else {
+            let executable =
+                std::env::current_exe().context("cannot locate remote sshai-worker binary")?;
+            write_shim(
+                &bin_dir.join("sshai"),
+                &executable,
+                &socket_path,
+                &options.session_id,
+            )
+            .await?;
+            write_shell_support(&options.session_dir, &bin_dir).await?
+        };
 
         let listener = UnixListener::bind(&socket_path)
             .with_context(|| format!("cannot bind {}", socket_path.display()))?;
@@ -211,6 +220,14 @@ mod unix {
         if options.argv.is_empty() {
             bail!("missing sshai command; try `sshai help`");
         }
+        let long_running = options
+            .argv
+            .first()
+            .is_some_and(|command| matches!(command.as_str(), "codex" | "claude"));
+        let cwd = std::env::current_dir()
+            .context("cannot determine the remote working directory")?
+            .to_string_lossy()
+            .into_owned();
         let mut stream = UnixStream::connect(&options.socket)
             .await
             .with_context(|| format!("cannot connect to {}", options.socket.display()))?;
@@ -220,15 +237,20 @@ mod unix {
                 protocol: PROTOCOL_VERSION,
                 session_id: options.session_id,
                 argv: options.argv,
+                cwd: Some(cwd),
             },
         )
         .await?;
-        let response = tokio::time::timeout(
-            Duration::from_secs(300),
-            read_frame::<_, ShimResponse>(&mut stream),
-        )
-        .await
-        .map_err(|_| anyhow!("local sshai command timed out"))??;
+        let response = if long_running {
+            read_frame::<_, ShimResponse>(&mut stream).await?
+        } else {
+            tokio::time::timeout(
+                Duration::from_secs(300),
+                read_frame::<_, ShimResponse>(&mut stream),
+            )
+            .await
+            .map_err(|_| anyhow!("local sshai command timed out"))??
+        };
         if !response.stdout.is_empty() {
             let mut stdout = tokio::io::stdout();
             stdout.write_all(response.stdout.as_bytes()).await?;
@@ -271,6 +293,10 @@ mod unix {
         if request.argv.is_empty() {
             return write_shim_error(&mut stream, "missing sshai command".to_owned()).await;
         }
+        let long_running = request
+            .argv
+            .first()
+            .is_some_and(|command| matches!(command.as_str(), "codex" | "claude"));
 
         let id = request_ids.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
@@ -280,6 +306,7 @@ mod unix {
             &AgentToClient::Request(ControlRequest {
                 id,
                 argv: request.argv,
+                cwd: request.cwd,
             }),
         )
         .await
@@ -288,10 +315,16 @@ mod unix {
             return Err(error);
         }
 
-        let response = tokio::time::timeout(Duration::from_secs(300), response_rx)
-            .await
-            .map_err(|_| anyhow!("local sshai command timed out"))?
-            .map_err(|_| anyhow!("local sshai control channel closed"))?;
+        let response = if long_running {
+            response_rx
+                .await
+                .map_err(|_| anyhow!("local sshai control channel closed"))?
+        } else {
+            tokio::time::timeout(Duration::from_secs(300), response_rx)
+                .await
+                .map_err(|_| anyhow!("local sshai command timed out"))?
+                .map_err(|_| anyhow!("local sshai control channel closed"))?
+        };
         write_frame(
             &mut stream,
             &ShimResponse {
@@ -325,12 +358,31 @@ mod unix {
         Ok(())
     }
 
-    async fn prepare_session_directory(path: &Path) -> Result<()> {
+    async fn prepare_session_directory(path: &Path, prepared: bool) -> Result<()> {
         if path.exists() {
-            bail!("agent session directory already exists: {}", path.display());
+            if !prepared {
+                bail!("agent session directory already exists: {}", path.display());
+            }
+            let metadata = std::fs::symlink_metadata(path)?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                bail!(
+                    "prepared agent session path is not a directory: {}",
+                    path.display()
+                );
+            }
+            return set_mode(path, 0o700).await;
         }
         tokio::fs::create_dir_all(path).await?;
         set_mode(path, 0o700).await
+    }
+
+    fn validate_prepared_file(path: &Path) -> Result<()> {
+        let metadata = std::fs::symlink_metadata(path)
+            .with_context(|| format!("cannot inspect prepared file {}", path.display()))?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            bail!("prepared path is not a regular file: {}", path.display());
+        }
+        Ok(())
     }
 
     async fn write_shim(
@@ -340,7 +392,7 @@ mod unix {
         session_id: &str,
     ) -> Result<()> {
         let script = format!(
-            "#!/bin/sh\nexec {} worker invoke --session-id {} --socket {} -- \"$@\"\n",
+            "#!/bin/sh\nexec {} invoke --session-id {} --socket {} -- \"$@\"\n",
             shell_quote(&executable.to_string_lossy()),
             shell_quote(session_id),
             shell_quote(&socket.to_string_lossy()),
@@ -354,7 +406,7 @@ mod unix {
         let bashrc = session_dir.join("bashrc");
         let shrc = session_dir.join("shrc");
         let zsh_dir = session_dir.join("zsh");
-        tokio::fs::create_dir(&zsh_dir).await?;
+        tokio::fs::create_dir_all(&zsh_dir).await?;
         set_mode(&zsh_dir, 0o700).await?;
 
         let quoted_bin = shell_quote(&bin_dir.to_string_lossy());
@@ -465,6 +517,16 @@ export PATH={quoted_bin}:$PATH\n"
         #[test]
         fn quotes_remote_paths() {
             assert_eq!(shell_quote("/tmp/a'b"), "'/tmp/a'\\''b'");
+        }
+
+        #[tokio::test]
+        async fn accepts_only_explicitly_prepared_session_directories() {
+            let root = tempfile::tempdir().unwrap();
+            let session = root.path().join("session");
+            tokio::fs::create_dir(&session).await.unwrap();
+
+            assert!(prepare_session_directory(&session, true).await.is_ok());
+            assert!(prepare_session_directory(&session, false).await.is_err());
         }
     }
 }

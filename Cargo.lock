@@ -2443,6 +2443,7 @@ name = "sshai"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "serde_json",
  "sshai-agent",
