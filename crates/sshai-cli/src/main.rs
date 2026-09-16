@@ -403,23 +403,33 @@ async fn run(cli: Cli) -> Result<u8> {
 
     if let Some(targets) = cli.target {
         let session = connector.connect(targets.primary()).await?;
-        let exit = if cli.no_worker {
+        if cli.no_worker {
             if targets.0.len() > 1 {
                 anyhow::bail!("multiple targets require the session worker; remove --no-worker");
             }
-            session.interactive_shell().await?
-        } else {
-            let mut handler = AiSessionCommand {
-                targets: targets.into_vec(),
-                local_root: resolve_local_root(&launch_directory, None)?,
-                config: launch_config,
-                flags: launch_flags,
-            };
-            session
-                .interactive_shell_with_agent_handler(&mut handler)
-                .await?
+            let exit = session.interactive_shell().await?;
+            session.disconnect().await?;
+            return Ok(exit_code(exit.code, exit.signal.as_deref()));
+        }
+
+        let targets = targets.into_vec();
+        let mut handler = AiSessionCommand {
+            targets: targets.clone(),
+            local_root: resolve_local_root(&launch_directory, None)?,
+            config: launch_config,
+            flags: launch_flags,
         };
-        session.disconnect().await?;
+        let exit = if targets.len() > 1 {
+            connector
+                .interactive_shell_multiplexed(session, targets, &mut handler)
+                .await?
+        } else {
+            let exit = session
+                .interactive_shell_with_agent_handler(&mut handler)
+                .await?;
+            session.disconnect().await?;
+            exit
+        };
         return Ok(exit_code(exit.code, exit.signal.as_deref()));
     }
 
@@ -476,14 +486,8 @@ async fn run(cli: Cli) -> Result<u8> {
             Ok(code)
         }
         Command::Mcp { target, local_dir } => {
-            let session = connector.connect(&target).await?;
-            let workspace = session.workspace().await?;
-            let sftp = session.sftp().await?;
             let local_root = resolve_local_root(&launch_directory, local_dir.as_deref())?;
-            let serve_result = sshai_mcp::serve(workspace, sftp, local_root).await;
-            let disconnect_result = session.disconnect().await;
-            serve_result?;
-            disconnect_result?;
+            sshai_mcp::serve(connector, target, local_root).await?;
             Ok(0)
         }
         Command::Agent {
@@ -621,9 +625,10 @@ impl SessionCommandHandler for AiSessionCommand {
         &mut self,
         command: &str,
         arguments: &[String],
+        session_index: usize,
         remote_cwd: Option<&str>,
     ) -> SessionCommandResult {
-        let targets = targets_at_primary_remote_cwd(&self.targets, remote_cwd);
+        let targets = targets_at_session_remote_cwd(&self.targets, session_index, remote_cwd);
         let result = match arguments.split_first() {
             Some((agent, arguments)) => {
                 match session_agent_arguments(&self.local_root, arguments) {
@@ -670,10 +675,18 @@ fn is_agent_name(value: &str) -> bool {
         })
 }
 
-fn targets_at_primary_remote_cwd(targets: &[Target], remote_cwd: Option<&str>) -> Vec<Target> {
+fn targets_at_session_remote_cwd(
+    targets: &[Target],
+    session_index: usize,
+    remote_cwd: Option<&str>,
+) -> Vec<Target> {
     let mut targets = targets.to_vec();
-    if let (Some(primary), Some(remote_cwd)) = (targets.first_mut(), remote_cwd) {
-        primary.path = Some(remote_cwd.to_owned());
+    if session_index < targets.len() {
+        let mut selected = targets.remove(session_index);
+        if let Some(remote_cwd) = remote_cwd {
+            selected.path = Some(remote_cwd.to_owned());
+        }
+        targets.insert(0, selected);
     }
     targets
 }
@@ -1636,10 +1649,22 @@ mod tests {
             "ka@ka2:/initial".parse().unwrap(),
             "build:/opt/build".parse().unwrap(),
         ];
-        let targets = targets_at_primary_remote_cwd(&targets, Some("/srv/project"));
+        let targets = targets_at_session_remote_cwd(&targets, 0, Some("/srv/project"));
 
         assert_eq!(targets[0].to_string(), "ka@ka2:/srv/project");
         assert_eq!(targets[1].to_string(), "build:/opt/build");
+    }
+
+    #[test]
+    fn session_agent_promotes_the_selected_remote() {
+        let targets = vec![
+            "ka@ka2:/initial".parse().unwrap(),
+            "build:/opt/build".parse().unwrap(),
+        ];
+        let targets = targets_at_session_remote_cwd(&targets, 1, Some("/srv/current"));
+
+        assert_eq!(targets[0].to_string(), "build:/srv/current");
+        assert_eq!(targets[1].to_string(), "ka@ka2:/initial");
     }
 
     #[test]

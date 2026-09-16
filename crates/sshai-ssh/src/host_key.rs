@@ -10,11 +10,15 @@ use crate::{HostKeyPolicy, ResolvedTarget, SshError};
 #[derive(Clone)]
 pub(crate) struct ClientHandler {
     target: Arc<ResolvedTarget>,
+    allow_prompt: bool,
 }
 
 impl ClientHandler {
-    pub(crate) fn new(target: Arc<ResolvedTarget>) -> Self {
-        Self { target }
+    pub(crate) fn new(target: Arc<ResolvedTarget>, allow_prompt: bool) -> Self {
+        Self {
+            target,
+            allow_prompt,
+        }
     }
 }
 
@@ -78,12 +82,12 @@ impl client::Handler for ClientHandler {
                 Ok(true)
             }
             HostKeyPolicy::Ask => {
-                if !io::stdin().is_terminal() {
+                if !self.allow_prompt || !io::stdin().is_terminal() {
                     return Err(SshError::HostKey {
                         host: target.host.clone(),
                         port: target.port,
                         message: format!(
-                            "unknown host key {fingerprint}; cannot prompt without a terminal"
+                            "unknown host key {fingerprint}; background/batch connections cannot prompt"
                         ),
                     });
                 }

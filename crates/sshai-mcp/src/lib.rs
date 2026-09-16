@@ -1,42 +1,419 @@
-use std::path::{Component, Path, PathBuf};
+use std::{
+    collections::VecDeque,
+    path::{Component, Path, PathBuf},
+    sync::Arc,
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::{Map, Value, json};
-use sshai_ssh::{SftpClient, WorkspaceClient};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use sshai_core::Target;
+use sshai_ssh::{SftpClient, SshConnector, SshError, SshSession, WorkspaceClient};
+use tokio::{
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    sync::{Mutex, RwLock, mpsc, oneshot},
+    task::JoinSet,
+    time::Instant,
+};
 
 const MAX_MCP_MESSAGE: usize = 1024 * 1024;
 const MCP_FALLBACK_VERSION: &str = "2025-11-25";
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(10);
+const TOOL_RECONNECT_WAIT: Duration = Duration::from_secs(45);
+const RECONNECT_BASE: Duration = Duration::from_millis(250);
+const RECONNECT_MAX: Duration = Duration::from_secs(30);
 
-pub async fn serve(
-    mut workspace: WorkspaceClient,
+pub async fn serve(connector: SshConnector, target: Target, local_root: PathBuf) -> Result<()> {
+    let status = Arc::new(RwLock::new(ConnectionStatus::new(target.to_string())));
+    let (commands, command_rx) = mpsc::channel(128);
+    let handle = RemoteHandle {
+        commands,
+        status: Arc::clone(&status),
+    };
+    let manager = tokio::spawn(connection_manager(
+        connector, target, local_root, status, command_rx,
+    ));
+    let result = serve_inner(handle.clone()).await;
+    handle.shutdown().await;
+    let _ = manager.await;
+    result
+}
+
+struct RemoteConnection {
+    session: SshSession,
+    workspace: WorkspaceClient,
     sftp: SftpClient,
-    local_root: PathBuf,
-) -> Result<()> {
-    let result = serve_inner(&mut workspace, &sftp, &local_root).await;
-    let workspace_close = workspace.close().await;
-    let sftp_close = sftp.close().await;
-    match (result, workspace_close, sftp_close) {
-        (Err(error), _, _) => Err(error),
-        (Ok(()), Err(error), _) => Err(error.into()),
-        (Ok(()), Ok(()), Err(error)) => Err(error.into()),
-        (Ok(()), Ok(()), Ok(())) => Ok(()),
+}
+
+#[derive(Clone)]
+struct RemoteHandle {
+    commands: mpsc::Sender<ManagerCommand>,
+    status: Arc<RwLock<ConnectionStatus>>,
+}
+
+struct PendingTool {
+    name: String,
+    arguments: Map<String, Value>,
+    response: oneshot::Sender<Result<Value>>,
+}
+
+enum ManagerCommand {
+    Tool(PendingTool),
+    Shutdown,
+}
+
+#[derive(Clone)]
+struct ConnectionStatus {
+    target: String,
+    phase: &'static str,
+    generation: u64,
+    reconnect_attempt: u32,
+    total_reconnects: u64,
+    queue_depth: usize,
+    connected_since_unix_ms: Option<u64>,
+    outage_since_unix_ms: Option<u64>,
+    last_heartbeat_unix_ms: Option<u64>,
+    next_retry_unix_ms: Option<u64>,
+    last_error: Option<String>,
+}
+
+impl ConnectionStatus {
+    fn new(target: String) -> Self {
+        Self {
+            target,
+            phase: "connecting",
+            generation: 0,
+            reconnect_attempt: 0,
+            total_reconnects: 0,
+            queue_depth: 0,
+            connected_since_unix_ms: None,
+            outage_since_unix_ms: Some(now_unix_ms()),
+            last_heartbeat_unix_ms: None,
+            next_retry_unix_ms: Some(now_unix_ms()),
+            last_error: None,
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({
+            "target": self.target,
+            "phase": self.phase,
+            "generation": self.generation,
+            "reconnect_attempt": self.reconnect_attempt,
+            "total_reconnects": self.total_reconnects,
+            "queue_depth": self.queue_depth,
+            "connected_since_unix_ms": self.connected_since_unix_ms,
+            "outage_since_unix_ms": self.outage_since_unix_ms,
+            "last_heartbeat_unix_ms": self.last_heartbeat_unix_ms,
+            "next_retry_unix_ms": self.next_retry_unix_ms,
+            "last_error": self.last_error,
+            "heartbeat_interval_seconds": HEARTBEAT_INTERVAL.as_secs(),
+            "max_reconnect_delay_seconds": RECONNECT_MAX.as_secs(),
+        })
     }
 }
 
-async fn serve_inner(
-    workspace: &mut WorkspaceClient,
-    sftp: &SftpClient,
-    local_root: &Path,
-) -> Result<()> {
+impl RemoteHandle {
+    async fn execute(&self, name: String, arguments: Map<String, Value>) -> Result<Value> {
+        let (response, receive) = oneshot::channel();
+        self.commands
+            .send(ManagerCommand::Tool(PendingTool {
+                name,
+                arguments,
+                response,
+            }))
+            .await
+            .map_err(|_| anyhow!("SSH connection manager stopped"))?;
+        match tokio::time::timeout(TOOL_RECONNECT_WAIT, receive).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => bail!("SSH connection manager stopped before returning the tool result"),
+            Err(_) => bail!(
+                "remote is still reconnecting in the background after {} seconds; call workspace_connection_info for status and retry later",
+                TOOL_RECONNECT_WAIT.as_secs()
+            ),
+        }
+    }
+
+    async fn status(&self) -> Value {
+        self.status.read().await.json()
+    }
+
+    async fn shutdown(&self) {
+        let _ = self.commands.send(ManagerCommand::Shutdown).await;
+    }
+}
+
+async fn connection_manager(
+    connector: SshConnector,
+    target: Target,
+    local_root: PathBuf,
+    status: Arc<RwLock<ConnectionStatus>>,
+    mut commands: mpsc::Receiver<ManagerCommand>,
+) {
+    let mut connection = None;
+    let mut pending = VecDeque::<PendingTool>::new();
+    let mut reconnect_attempt = 0_u32;
+    let mut next_retry = Instant::now();
+    let mut last_connect_attempt = Instant::now() - Duration::from_secs(1);
+    let mut heartbeat_at = Instant::now() + HEARTBEAT_INTERVAL;
+    let mut jitter = jitter_seed();
+
+    loop {
+        while pending
+            .front()
+            .is_some_and(|tool| tool.response.is_closed())
+        {
+            pending.pop_front();
+        }
+        update_queue_depth(&status, pending.len()).await;
+
+        if connection.is_some() && !pending.is_empty() {
+            let tool = pending.pop_front().expect("pending tool was checked");
+            let remote = connection.as_mut().expect("connection was checked");
+            update_queue_depth(&status, pending.len()).await;
+            let result = call_tool_once(remote, &local_root, &tool.name, &tool.arguments).await;
+            match result {
+                Ok(value) => {
+                    let _ = tool.response.send(Ok(value));
+                    heartbeat_at = Instant::now() + HEARTBEAT_INTERVAL;
+                }
+                Err(error) if is_connection_lost(&error) => {
+                    mark_disconnected(&status, &error).await;
+                    connection.take();
+                    next_retry = Instant::now();
+                    reconnect_attempt = 0;
+                    if safe_to_retry(&tool.name) {
+                        pending.push_front(tool);
+                    } else {
+                        let _ = tool.response.send(Err(anyhow!(
+                            "SSH connection was lost during {}, so completion is uncertain. sshai is reconnecting in the background and did not repeat the operation; inspect remote state before retrying",
+                            tool.name
+                        )));
+                    }
+                }
+                Err(error) => {
+                    let _ = tool.response.send(Err(error));
+                }
+            }
+            continue;
+        }
+
+        if let Some(remote) = connection.as_mut() {
+            tokio::select! {
+                command = commands.recv() => {
+                    match command {
+                        Some(ManagerCommand::Tool(tool)) => pending.push_back(tool),
+                        Some(ManagerCommand::Shutdown) | None => break,
+                    }
+                }
+                _ = tokio::time::sleep_until(heartbeat_at) => {
+                    let heartbeat = tokio::time::timeout(HEARTBEAT_TIMEOUT, remote.workspace.open()).await;
+                    match heartbeat {
+                        Ok(Ok(_)) => {
+                            let mut current = status.write().await;
+                            current.last_heartbeat_unix_ms = Some(now_unix_ms());
+                            current.last_error = None;
+                            heartbeat_at = Instant::now() + HEARTBEAT_INTERVAL;
+                        }
+                        Ok(Err(error)) if !error.is_connection_lost() => {
+                            let mut current = status.write().await;
+                            current.last_heartbeat_unix_ms = Some(now_unix_ms());
+                            current.last_error = Some(format!("heartbeat operation failed: {error}"));
+                            heartbeat_at = Instant::now() + HEARTBEAT_INTERVAL;
+                        }
+                        Ok(Err(error)) => {
+                            mark_disconnected(&status, &anyhow::Error::new(error)).await;
+                            connection.take();
+                            reconnect_attempt = 0;
+                            next_retry = Instant::now();
+                        }
+                        Err(_) => {
+                            mark_disconnected_message(&status, "heartbeat timed out").await;
+                            connection.take();
+                            reconnect_attempt = 0;
+                            next_retry = Instant::now();
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        tokio::select! {
+            command = commands.recv() => {
+                match command {
+                    Some(ManagerCommand::Tool(tool)) => {
+                        pending.push_back(tool);
+                        if last_connect_attempt.elapsed() >= Duration::from_secs(1) {
+                            next_retry = Instant::now();
+                        }
+                    }
+                    Some(ManagerCommand::Shutdown) | None => break,
+                }
+            }
+            _ = tokio::time::sleep_until(next_retry) => {
+                last_connect_attempt = Instant::now();
+                mark_connecting(&status, reconnect_attempt.saturating_add(1)).await;
+                match connect_once(&connector, &target).await {
+                    Ok(remote) => {
+                        connection = Some(remote);
+                        reconnect_attempt = 0;
+                        heartbeat_at = Instant::now() + HEARTBEAT_INTERVAL;
+                        mark_connected(&status).await;
+                    }
+                    Err(error) => {
+                        reconnect_attempt = reconnect_attempt.saturating_add(1);
+                        let delay = reconnect_delay(reconnect_attempt, &mut jitter);
+                        next_retry = Instant::now() + delay;
+                        mark_retry_wait(&status, reconnect_attempt, delay, &error).await;
+                        eprintln!(
+                            "sshai mcp: reconnect attempt {reconnect_attempt} to {target} failed: {error:#}; retrying in {:.2}s",
+                            delay.as_secs_f64()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(remote) = connection.take() {
+        close_connection(remote).await;
+    }
+    for tool in pending {
+        let _ = tool
+            .response
+            .send(Err(anyhow!("SSH connection manager stopped")));
+    }
+}
+
+async fn connect_once(connector: &SshConnector, target: &Target) -> Result<RemoteConnection> {
+    let session = connector.connect(target).await?;
+    let workspace = session.workspace().await?;
+    let sftp = session.sftp().await?;
+    Ok(RemoteConnection {
+        session,
+        workspace,
+        sftp,
+    })
+}
+
+async fn close_connection(mut connection: RemoteConnection) {
+    let _ = connection.workspace.close().await;
+    let _ = connection.sftp.close().await;
+    let _ = connection.session.disconnect().await;
+}
+
+async fn update_queue_depth(status: &RwLock<ConnectionStatus>, depth: usize) {
+    status.write().await.queue_depth = depth;
+}
+
+async fn mark_connecting(status: &RwLock<ConnectionStatus>, attempt: u32) {
+    let mut current = status.write().await;
+    current.phase = if current.generation == 0 {
+        "connecting"
+    } else {
+        "reconnecting"
+    };
+    current.reconnect_attempt = attempt;
+    current.next_retry_unix_ms = None;
+}
+
+async fn mark_connected(status: &RwLock<ConnectionStatus>) {
+    let mut current = status.write().await;
+    if current.generation > 0 {
+        current.total_reconnects = current.total_reconnects.saturating_add(1);
+    }
+    current.generation = current.generation.saturating_add(1);
+    current.phase = "connected";
+    current.reconnect_attempt = 0;
+    current.connected_since_unix_ms = Some(now_unix_ms());
+    current.outage_since_unix_ms = None;
+    current.last_heartbeat_unix_ms = Some(now_unix_ms());
+    current.next_retry_unix_ms = None;
+    current.last_error = None;
+    eprintln!(
+        "sshai mcp: connected to {} (connection generation {})",
+        current.target, current.generation
+    );
+}
+
+async fn mark_disconnected(status: &RwLock<ConnectionStatus>, error: &anyhow::Error) {
+    mark_disconnected_message(status, &format!("{error:#}")).await;
+}
+
+async fn mark_disconnected_message(status: &RwLock<ConnectionStatus>, message: &str) {
+    let mut current = status.write().await;
+    current.phase = "reconnecting";
+    current.connected_since_unix_ms = None;
+    current.outage_since_unix_ms.get_or_insert_with(now_unix_ms);
+    current.next_retry_unix_ms = Some(now_unix_ms());
+    current.last_error = Some(message.to_owned());
+}
+
+async fn mark_retry_wait(
+    status: &RwLock<ConnectionStatus>,
+    attempt: u32,
+    delay: Duration,
+    error: &anyhow::Error,
+) {
+    let mut current = status.write().await;
+    current.phase = if current.generation == 0 {
+        "connecting"
+    } else {
+        "reconnecting"
+    };
+    current.reconnect_attempt = attempt;
+    current.outage_since_unix_ms.get_or_insert_with(now_unix_ms);
+    current.next_retry_unix_ms =
+        Some(now_unix_ms().saturating_add(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX)));
+    current.last_error = Some(format!("{error:#}"));
+}
+
+fn reconnect_delay(attempt: u32, jitter: &mut u64) -> Duration {
+    let exponent = attempt.saturating_sub(1).min(16);
+    let multiplier = 1_u64 << exponent;
+    let base_ms = u64::try_from(RECONNECT_BASE.as_millis())
+        .unwrap_or(u64::MAX)
+        .saturating_mul(multiplier);
+    *jitter ^= *jitter << 13;
+    *jitter ^= *jitter >> 7;
+    *jitter ^= *jitter << 17;
+    let percent = 75_u64 + (*jitter % 51);
+    let jittered_ms = base_ms.saturating_mul(percent) / 100;
+    Duration::from_millis(
+        jittered_ms.min(u64::try_from(RECONNECT_MAX.as_millis()).unwrap_or(u64::MAX)),
+    )
+}
+
+fn jitter_seed() -> u64 {
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    seed ^ u64::from(std::process::id()) ^ 0x9e37_79b9_7f4a_7c15
+}
+
+fn now_unix_ms() -> u64 {
+    u64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis(),
+    )
+    .unwrap_or(u64::MAX)
+}
+
+async fn serve_inner(remote: RemoteHandle) -> Result<()> {
     let mut input = BufReader::new(tokio::io::stdin());
-    let mut output = tokio::io::stdout();
+    let output = Arc::new(Mutex::new(tokio::io::stdout()));
+    let mut requests = JoinSet::new();
     let mut buffer = Vec::new();
     loop {
         buffer.clear();
         let read = input.read_until(b'\n', &mut buffer).await?;
         if read == 0 {
-            return Ok(());
+            break;
         }
         if buffer.len() > MAX_MCP_MESSAGE {
             bail!("MCP request exceeds {MAX_MCP_MESSAGE} bytes");
@@ -50,8 +427,8 @@ async fn serve_inner(
         let message: Value = match serde_json::from_slice(&buffer) {
             Ok(message) => message,
             Err(error) => {
-                write_message(
-                    &mut output,
+                write_message_locked(
+                    &output,
                     &error_response(Value::Null, -32700, format!("parse error: {error}")),
                 )
                 .await?;
@@ -61,20 +438,26 @@ async fn serve_inner(
         let Some(id) = message.get("id").cloned() else {
             continue;
         };
-        let response = match handle_request(workspace, sftp, local_root, &message).await {
-            Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
-            Err(error) => error_response(id, -32602, format!("{error:#}")),
-        };
-        write_message(&mut output, &response).await?;
+        let remote = remote.clone();
+        let output = Arc::clone(&output);
+        requests.spawn(async move {
+            let response = match handle_request(&remote, &message).await {
+                Ok(result) => json!({"jsonrpc": "2.0", "id": id, "result": result}),
+                Err(error) => error_response(id, -32602, format!("{error:#}")),
+            };
+            write_message_locked(&output, &response).await
+        });
+        while let Some(result) = requests.try_join_next() {
+            result.map_err(|error| anyhow!("MCP request task failed: {error}"))??;
+        }
     }
+    while let Some(result) = requests.join_next().await {
+        result.map_err(|error| anyhow!("MCP request task failed: {error}"))??;
+    }
+    Ok(())
 }
 
-async fn handle_request(
-    workspace: &mut WorkspaceClient,
-    sftp: &SftpClient,
-    local_root: &Path,
-    message: &Value,
-) -> Result<Value> {
+async fn handle_request(remote: &RemoteHandle, message: &Value) -> Result<Value> {
     if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
         bail!("jsonrpc must be \"2.0\"");
     }
@@ -93,7 +476,7 @@ async fn handle_request(
                 "protocolVersion": protocol,
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": "sshai", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "This is the REMOTE side of an sshai dual-workspace session. Native file and shell tools operate on LOCAL; workspace_* tools operate on REMOTE. Ordinary workspace paths are relative to the negotiated remote root. Use workspace_transfer for direct non-overwriting LOCAL/REMOTE copies; its remote_path may also be absolute. Only use workspace_transfer_overwrite after the user explicitly requests replacement. A remote cp command cannot read LOCAL files."
+                "instructions": "This is the REMOTE side of an sshai dual-workspace session. Native file and shell tools operate on LOCAL; workspace_* tools operate on REMOTE. Ordinary workspace paths are relative to the negotiated remote root. Use workspace_transfer for direct non-overwriting LOCAL/REMOTE copies; its remote_path may also be absolute. Only use workspace_transfer_overwrite after the user explicitly requests replacement. A remote cp command cannot read LOCAL files. sshai proactively heartbeats REMOTE and reconnects forever with jittered exponential backoff. Calls arriving during reconnect wait in one ordered queue. Read-only workspace calls interrupted by transport loss are safely replayed; writes, execution, and transfers with uncertain completion are never repeated automatically. workspace_connection_info remains available while REMOTE is offline."
             }))
         }
         "server/discover" => Ok(json!({
@@ -103,21 +486,17 @@ async fn handle_request(
         "ping" => Ok(json!({})),
         "tools/list" => {
             let mut tools = sshai_tools::definitions();
+            tools.push(connection_status_definition());
             tools.push(transfer_definition(false));
             tools.push(transfer_definition(true));
             Ok(json!({"tools": tools}))
         }
-        "tools/call" => call_tool(workspace, sftp, local_root, &params).await,
+        "tools/call" => call_tool(remote, &params).await,
         _ => bail!("method not found: {method}"),
     }
 }
 
-async fn call_tool(
-    workspace: &mut WorkspaceClient,
-    sftp: &SftpClient,
-    local_root: &Path,
-    params: &Value,
-) -> Result<Value> {
+async fn call_tool(remote: &RemoteHandle, params: &Value) -> Result<Value> {
     let name = params
         .get("name")
         .and_then(Value::as_str)
@@ -127,14 +506,61 @@ async fn call_tool(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let result = match name {
-        "workspace_transfer" => transfer(sftp, local_root, &arguments, false).await,
-        "workspace_transfer_overwrite" => transfer(sftp, local_root, &arguments, true).await,
-        _ => sshai_tools::dispatch(workspace, name, &arguments).await,
+    let result = if name == "workspace_connection_info" {
+        Ok(remote.status().await)
+    } else {
+        remote.execute(name.to_owned(), arguments).await
     };
     Ok(match result {
         Ok(value) => tool_result(value, false),
         Err(error) => tool_result(json!({"error": format!("{error:#}")}), true),
+    })
+}
+
+async fn call_tool_once(
+    connection: &mut RemoteConnection,
+    local_root: &Path,
+    name: &str,
+    arguments: &Map<String, Value>,
+) -> Result<Value> {
+    match name {
+        "workspace_transfer" => transfer(&connection.sftp, local_root, arguments, false).await,
+        "workspace_transfer_overwrite" => {
+            transfer(&connection.sftp, local_root, arguments, true).await
+        }
+        _ => sshai_tools::dispatch(&mut connection.workspace, name, arguments).await,
+    }
+}
+
+fn safe_to_retry(name: &str) -> bool {
+    matches!(
+        name,
+        "workspace_info"
+            | "workspace_list"
+            | "workspace_stat"
+            | "workspace_read"
+            | "workspace_hash"
+    )
+}
+
+fn is_connection_lost(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<SshError>()
+            .is_some_and(SshError::is_connection_lost)
+    })
+}
+
+fn connection_status_definition() -> Value {
+    json!({
+        "name": "workspace_connection_info",
+        "description": "Report sshai's live SSH connection state, reconnect generation, queued calls, heartbeat, retry timing, and last transport error. This local status tool remains available while REMOTE is offline.",
+        "inputSchema": {"type": "object", "properties": {}},
+        "annotations": {
+            "readOnlyHint": true,
+            "destructiveHint": false,
+            "openWorldHint": false
+        }
     })
 }
 
@@ -345,9 +771,10 @@ fn error_response(id: Value, code: i64, message: String) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
-async fn write_message(output: &mut tokio::io::Stdout, message: &Value) -> Result<()> {
+async fn write_message_locked(output: &Mutex<tokio::io::Stdout>, message: &Value) -> Result<()> {
     let mut encoded = serde_json::to_vec(message)?;
     encoded.push(b'\n');
+    let mut output = output.lock().await;
     output.write_all(&encoded).await?;
     output.flush().await?;
     Ok(())
@@ -408,5 +835,64 @@ mod tests {
         );
         assert!(normalize_remote_path("../secret").is_err());
         assert_eq!(normalize_remote_path("/etc/passwd").unwrap(), "/etc/passwd");
+    }
+
+    #[test]
+    fn retries_only_side_effect_free_workspace_calls() {
+        for name in [
+            "workspace_info",
+            "workspace_list",
+            "workspace_stat",
+            "workspace_read",
+            "workspace_hash",
+        ] {
+            assert!(safe_to_retry(name), "{name}");
+        }
+        for name in [
+            "workspace_write",
+            "workspace_edit",
+            "workspace_mkdir",
+            "workspace_rename",
+            "workspace_remove",
+            "workspace_exec",
+            "workspace_transfer",
+            "workspace_transfer_overwrite",
+        ] {
+            assert!(!safe_to_retry(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn recognizes_wrapped_transport_loss() {
+        let error = anyhow::Error::new(SshError::Agent("channel closed".to_owned()))
+            .context("workspace_info failed");
+        assert!(is_connection_lost(&error));
+
+        let error = anyhow::Error::new(SshError::Config("bad path".to_owned()));
+        assert!(!is_connection_lost(&error));
+    }
+
+    #[test]
+    fn reconnect_backoff_is_jittered_and_capped() {
+        let mut jitter = 0x1234_5678_9abc_def0;
+        let first = reconnect_delay(1, &mut jitter);
+        assert!(first >= Duration::from_millis(187));
+        assert!(first <= Duration::from_millis(312));
+
+        for attempt in 2..40 {
+            assert!(reconnect_delay(attempt, &mut jitter) <= RECONNECT_MAX);
+        }
+    }
+
+    #[test]
+    fn connection_status_tool_is_local_and_read_only() {
+        let definition = connection_status_definition();
+        assert_eq!(definition["name"], "workspace_connection_info");
+        assert_eq!(definition["annotations"]["readOnlyHint"], true);
+
+        let status = ConnectionStatus::new("host".to_owned()).json();
+        assert_eq!(status["phase"], "connecting");
+        assert_eq!(status["target"], "host");
+        assert_eq!(status["queue_depth"], 0);
     }
 }

@@ -65,3 +65,85 @@ pub enum SshError {
     #[error("remote sshai agent error: {0}")]
     Agent(String),
 }
+
+impl SshError {
+    /// Whether retrying through a newly authenticated SSH session may recover
+    /// from this error. Configuration, authorization, and remote operation
+    /// failures deliberately return false.
+    pub fn is_connection_lost(&self) -> bool {
+        match self {
+            Self::Connect { .. } | Self::ConnectTimeout { .. } => true,
+            Self::Io(error) => matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::UnexpectedEof
+            ),
+            Self::Russh(error) => matches!(
+                error,
+                russh::Error::Disconnect
+                    | russh::Error::HUP
+                    | russh::Error::ConnectionTimeout
+                    | russh::Error::KeepaliveTimeout
+                    | russh::Error::InactivityTimeout
+                    | russh::Error::SendError
+                    | russh::Error::RecvError
+                    | russh::Error::WrongChannel
+            ),
+            Self::Protocol(sshai_protocol::ProtocolError::Closed) => true,
+            Self::Protocol(sshai_protocol::ProtocolError::Io(error)) => matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::NotConnected
+                    | io::ErrorKind::TimedOut
+                    | io::ErrorKind::UnexpectedEof
+            ),
+            Self::Sftp(error) => {
+                let message = error.to_string().to_ascii_lowercase();
+                message.contains("eof")
+                    || message.contains("senderror")
+                    || message.contains("recverror")
+                    || message.contains("channel closed")
+                    || message.contains("connection closed")
+                    || message == "timeout"
+            }
+            Self::Agent(message) => {
+                let message = message.to_ascii_lowercase();
+                message.contains("channel closed")
+                    || message.contains("control channel closed")
+                    || message.contains("remote agent stopped")
+                    || message.contains("remote worker stopped")
+                    || message.contains("startup timed out")
+                    || message.contains("connection closed")
+                    || message.contains("broken pipe")
+            }
+            Self::Config(_)
+            | Self::HostKey { .. }
+            | Self::Authentication { .. }
+            | Self::PrivateKey { .. }
+            | Self::MissingExitStatus
+            | Self::RusshKey(_)
+            | Self::SshKey(_)
+            | Self::Protocol(_) => false,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn classifies_only_transport_failures_as_reconnectable() {
+        assert!(SshError::Protocol(sshai_protocol::ProtocolError::Closed).is_connection_lost());
+        assert!(SshError::Russh(russh::Error::HUP).is_connection_lost());
+        assert!(SshError::Agent("channel closed".to_owned()).is_connection_lost());
+        assert!(!SshError::Config("bad path".to_owned()).is_connection_lost());
+        assert!(!SshError::Agent("workspace not_found".to_owned()).is_connection_lost());
+    }
+}

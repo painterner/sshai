@@ -1,4 +1,5 @@
 use std::{
+    collections::VecDeque,
     env,
     future::Future,
     io::{IsTerminal, Read},
@@ -12,7 +13,11 @@ use russh::{ChannelMsg, Disconnect, Sig, client};
 use sha2::{Digest, Sha256};
 use sshai_core::Target;
 use sshai_protocol::{ControlRequest, ControlResponse};
-use tokio::{io::AsyncWriteExt, net::TcpStream};
+use tokio::{
+    io::AsyncWriteExt,
+    net::TcpStream,
+    sync::{mpsc, oneshot},
+};
 
 #[cfg(not(unix))]
 use tokio::io::AsyncReadExt;
@@ -53,6 +58,7 @@ pub trait SessionCommandHandler: Send {
         &mut self,
         command: &str,
         arguments: &[String],
+        session_index: usize,
         remote_cwd: Option<&str>,
     ) -> SessionCommandResult;
 }
@@ -82,6 +88,145 @@ struct ProgressiveCleanup {
     remote_session_dir: String,
     remote_executable: String,
     session_id: String,
+}
+
+const SHELL_REPLAY_LIMIT: usize = 4 * 1024 * 1024;
+const SWITCH_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(30);
+const SWITCH_PREVIOUS: &[u8] = b"\x1b[1;6D";
+const SWITCH_NEXT: &[u8] = b"\x1b[1;6C";
+
+enum MultiplexCommand {
+    Input(Vec<u8>),
+    Eof,
+    Resize(u32, u32),
+    ControlResponse(ControlResponse),
+    Shutdown,
+}
+
+enum MultiplexEvent {
+    Ready {
+        index: usize,
+        shell: MultiplexedShell,
+    },
+    Failed {
+        index: usize,
+        error: String,
+    },
+    Output {
+        index: usize,
+        data: Vec<u8>,
+    },
+    ControlRequest {
+        index: usize,
+        request: ControlRequest,
+    },
+    WorkerNotice {
+        index: usize,
+        message: String,
+    },
+    Exited {
+        index: usize,
+        code: Option<u32>,
+        signal: Option<String>,
+    },
+}
+
+struct MultiplexedShell {
+    label: String,
+    session: Arc<SshSession>,
+    commands: mpsc::Sender<MultiplexCommand>,
+    start: Option<oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    replay: ReplayBuffer,
+    open: bool,
+}
+
+#[derive(Default)]
+struct ReplayBuffer {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+}
+
+impl ReplayBuffer {
+    fn push(&mut self, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        let data = if data.len() > SHELL_REPLAY_LIMIT {
+            data[data.len() - SHELL_REPLAY_LIMIT..].to_vec()
+        } else {
+            data.to_vec()
+        };
+        self.bytes += data.len();
+        self.chunks.push_back(data);
+        while self.bytes > SHELL_REPLAY_LIMIT && self.chunks.len() > 1 {
+            if let Some(removed) = self.chunks.pop_front() {
+                self.bytes -= removed.len();
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InputAction {
+    Previous,
+    Next,
+}
+
+enum ParsedInput {
+    Data(Vec<u8>),
+    Switch(InputAction),
+}
+
+#[derive(Default)]
+struct SwitchInputParser {
+    pending: Vec<u8>,
+}
+
+impl SwitchInputParser {
+    fn feed(&mut self, input: &[u8]) -> Vec<ParsedInput> {
+        let mut bytes = std::mem::take(&mut self.pending);
+        bytes.extend_from_slice(input);
+        let mut parsed = Vec::new();
+        let mut data = Vec::new();
+        let mut index = 0;
+        while index < bytes.len() {
+            let remaining = &bytes[index..];
+            let matched = if remaining.starts_with(SWITCH_PREVIOUS) {
+                Some((SWITCH_PREVIOUS.len(), InputAction::Previous))
+            } else if remaining.starts_with(SWITCH_NEXT) {
+                Some((SWITCH_NEXT.len(), InputAction::Next))
+            } else {
+                None
+            };
+            if let Some((length, action)) = matched {
+                if !data.is_empty() {
+                    parsed.push(ParsedInput::Data(std::mem::take(&mut data)));
+                }
+                parsed.push(ParsedInput::Switch(action));
+                index += length;
+                continue;
+            }
+            if SWITCH_PREVIOUS.starts_with(remaining) || SWITCH_NEXT.starts_with(remaining) {
+                self.pending.extend_from_slice(remaining);
+                break;
+            }
+            data.push(bytes[index]);
+            index += 1;
+        }
+        if !data.is_empty() {
+            parsed.push(ParsedInput::Data(data));
+        }
+        parsed
+    }
+
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    fn flush(&mut self) -> Option<Vec<u8>> {
+        (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
+    }
 }
 
 type AgentStartup<'a> = Pin<Box<dyn Future<Output = Result<RemoteAgent>> + Send + 'a>>;
@@ -133,6 +278,7 @@ impl WorkerCompression {
     }
 }
 
+#[derive(Clone)]
 pub struct SshConnector {
     config: SshConfig,
     options: ConnectOptions,
@@ -304,6 +450,27 @@ impl SshConnector {
         })
     }
 
+    /// Run one persistent PTY per target while keeping the first target usable
+    /// before background connections to the remaining targets complete.
+    pub async fn interactive_shell_multiplexed(
+        &self,
+        primary: SshSession,
+        targets: Vec<Target>,
+        handler: &mut dyn SessionCommandHandler,
+    ) -> Result<CommandExit> {
+        if targets.len() < 2 {
+            return Err(SshError::Config(
+                "multiplexed SSH requires at least two targets".to_owned(),
+            ));
+        }
+        let mut background_connector = self.clone();
+        // Once the primary shell owns the terminal, a background connection
+        // must never consume password, key-passphrase, keyboard-interactive,
+        // or host-key confirmation input.
+        background_connector.options.allow_password = false;
+        run_multiplexed_shells(primary, background_connector, targets, handler).await
+    }
+
     fn build_route(
         &self,
         target: &ResolvedTarget,
@@ -352,7 +519,7 @@ impl SshConnector {
             nodelay: true,
             ..Default::default()
         };
-        let handler = ClientHandler::new(target.clone());
+        let handler = ClientHandler::new(target.clone(), self.options.allow_password);
         tokio::time::timeout(
             target.connect_timeout,
             client::connect_stream(Arc::new(config), stream, handler),
@@ -1044,6 +1211,7 @@ impl SshSession {
                                     .handle(
                                         &command,
                                         &request.argv[1..],
+                                        0,
                                         request.cwd.as_deref(),
                                     )
                                     .await;
@@ -1213,6 +1381,544 @@ impl SshSession {
             .await?;
         Ok(())
     }
+}
+
+async fn run_multiplexed_shells(
+    primary: SshSession,
+    background_connector: SshConnector,
+    targets: Vec<Target>,
+    handler: &mut dyn SessionCommandHandler,
+) -> Result<CommandExit> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(SshError::Config(
+            "interactive SSH requires a terminal".to_owned(),
+        ));
+    }
+
+    let total = targets.len();
+    let labels = targets.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let (events_tx, mut events_rx) = mpsc::channel(256);
+    let primary = Arc::new(primary);
+    let primary_shell = prepare_multiplexed_shell(
+        0,
+        labels[0].clone(),
+        Arc::clone(&primary),
+        events_tx.clone(),
+    )
+    .await?;
+
+    let mut raw_mode = Some(RawTerminalGuard::activate()?);
+    let mut stdin = InteractiveStdin::new()?;
+    let mut stdout = tokio::io::stdout();
+    let mut input = [0_u8; 8192];
+    let mut parser = SwitchInputParser::default();
+    let mut resize = ResizeEvents::new()?;
+    let mut stdin_closed = false;
+    let mut active = Some(0_usize);
+    let mut pending_connections = total - 1;
+    let mut statuses = vec!["connecting".to_owned(); total];
+    statuses[0] = "connected".to_owned();
+    let mut shells = (0..total)
+        .map(|_| None)
+        .collect::<Vec<Option<MultiplexedShell>>>();
+    shells[0] = Some(primary_shell);
+    start_multiplexed_shell(shells[0].as_mut().expect("primary shell exists"));
+
+    stdout
+        .write_all(
+            format!(
+                "\r\n\x1b[1;36m[sshai 1/{total}] {} — Ctrl+Shift+←/→ switches hosts\x1b[0m\r\n",
+                display_label(&labels[0])
+            )
+            .as_bytes(),
+        )
+        .await?;
+    stdout.flush().await?;
+
+    let mut connection_tasks = Vec::with_capacity(total - 1);
+    for (index, target) in targets.into_iter().enumerate().skip(1) {
+        let connector = background_connector.clone();
+        let events = events_tx.clone();
+        let label = labels[index].clone();
+        connection_tasks.push(tokio::spawn(async move {
+            let result = async {
+                let session = Arc::new(connector.connect(&target).await?);
+                prepare_multiplexed_shell(index, label, session, events.clone()).await
+            }
+            .await;
+            let event = match result {
+                Ok(shell) => MultiplexEvent::Ready { index, shell },
+                Err(error) => MultiplexEvent::Failed {
+                    index,
+                    error: format!("{error}"),
+                },
+            };
+            let _ = events.send(event).await;
+        }));
+    }
+    drop(events_tx);
+
+    let mut last_code = None;
+    let mut last_signal = None;
+    'multiplexer: loop {
+        let pending_timeout = tokio::time::sleep(SWITCH_SEQUENCE_TIMEOUT);
+        tokio::pin!(pending_timeout);
+        tokio::select! {
+            biased;
+            read = stdin.read(&mut input), if !stdin_closed => {
+                let read = read?;
+                if read == 0 {
+                    stdin_closed = true;
+                    for shell in shells.iter().flatten().filter(|shell| shell.open) {
+                        let _ = shell.commands.send(MultiplexCommand::Eof).await;
+                    }
+                } else {
+                    for parsed in parser.feed(&input[..read]) {
+                        match parsed {
+                            ParsedInput::Data(data) => {
+                                if let Some(commands) = active_shell_commands(&shells, active) {
+                                    let _ = commands.send(MultiplexCommand::Input(data)).await;
+                                }
+                            }
+                            ParsedInput::Switch(action) => {
+                                if let Some(current) = active {
+                                    if let Some(next) = adjacent_open_shell(&shells, current, action) {
+                                        active = Some(next);
+                                        render_multiplexed_shell(&mut stdout, &shells[next], next, total).await?;
+                                    } else {
+                                        write_multiplexer_status(
+                                            &mut stdout,
+                                            pending_connections,
+                                            &statuses,
+                                        )
+                                        .await?;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            event = events_rx.recv() => {
+                let Some(event) = event else { break 'multiplexer };
+                match event {
+                    MultiplexEvent::Ready { index, mut shell } => {
+                        pending_connections = pending_connections.saturating_sub(1);
+                        statuses[index] = "connected".to_owned();
+                        start_multiplexed_shell(&mut shell);
+                        shells[index] = Some(shell);
+                        if active.is_none() {
+                            active = Some(index);
+                            render_multiplexed_shell(&mut stdout, &shells[index], index, total).await?;
+                        }
+                    }
+                    MultiplexEvent::Failed { index, error } => {
+                        pending_connections = pending_connections.saturating_sub(1);
+                        statuses[index] = format!("failed: {error}");
+                        if active.is_none() && pending_connections == 0 {
+                            break 'multiplexer;
+                        }
+                    }
+                    MultiplexEvent::Output { index, data } => {
+                        if let Some(shell) = shells.get_mut(index).and_then(Option::as_mut) {
+                            shell.replay.push(&data);
+                            if active == Some(index) {
+                                stdout.write_all(&data).await?;
+                                stdout.flush().await?;
+                            }
+                        }
+                    }
+                    MultiplexEvent::WorkerNotice { index, message } => {
+                        let notice = format!("\r\nsshai: {message}\r\n").into_bytes();
+                        if let Some(shell) = shells.get_mut(index).and_then(Option::as_mut) {
+                            shell.replay.push(&notice);
+                            if active == Some(index) {
+                                stdout.write_all(&notice).await?;
+                                stdout.flush().await?;
+                            }
+                        }
+                    }
+                    MultiplexEvent::ControlRequest { index, request } => {
+                        let Some(shell) = shells.get(index).and_then(Option::as_ref) else {
+                            continue;
+                        };
+                        let session = Arc::clone(&shell.session);
+                        let commands = shell.commands.clone();
+                        let external_command = request.argv.first().and_then(|command| {
+                            handler.handles(command).then(|| command.clone())
+                        });
+                        let response = if let Some(command) = external_command {
+                            drop(raw_mode.take());
+                            let result = handler
+                                .handle(
+                                    &command,
+                                    &request.argv[1..],
+                                    index,
+                                    request.cwd.as_deref(),
+                                )
+                                .await;
+                            raw_mode = Some(RawTerminalGuard::activate()?);
+                            ControlResponse {
+                                id: request.id,
+                                exit_code: result.exit_code,
+                                stdout: result.stdout,
+                                stderr: result.stderr,
+                            }
+                        } else {
+                            session.handle_control_request(request).await
+                        };
+                        let _ = commands
+                            .send(MultiplexCommand::ControlResponse(response))
+                            .await;
+                    }
+                    MultiplexEvent::Exited { index, code, signal } => {
+                        last_code = code.or(last_code);
+                        last_signal = signal.or(last_signal);
+                        statuses[index] = "closed".to_owned();
+                        if let Some(shell) = shells.get_mut(index).and_then(Option::as_mut) {
+                            shell.open = false;
+                        }
+                        if active == Some(index) {
+                            active = adjacent_open_shell(&shells, index, InputAction::Next);
+                            if let Some(next) = active {
+                                render_multiplexed_shell(&mut stdout, &shells[next], next, total).await?;
+                            } else if pending_connections > 0 {
+                                stdout
+                                    .write_all(b"\r\n\x1b[1;33m[sshai] waiting for background hosts...\x1b[0m\r\n")
+                                    .await?;
+                                stdout.flush().await?;
+                            }
+                        }
+                        if active.is_none() && pending_connections == 0 {
+                            break 'multiplexer;
+                        }
+                    }
+                }
+            }
+            _ = resize.recv() => {
+                let (columns, rows) = terminal_size();
+                for shell in shells.iter().flatten().filter(|shell| shell.open) {
+                    let _ = shell
+                        .commands
+                        .send(MultiplexCommand::Resize(columns, rows))
+                        .await;
+                }
+            }
+            _ = &mut pending_timeout, if parser.has_pending() => {
+                if let Some(data) = parser.flush() {
+                    if let Some(commands) = active_shell_commands(&shells, active) {
+                        let _ = commands.send(MultiplexCommand::Input(data)).await;
+                    }
+                }
+            }
+        }
+    }
+
+    drop(raw_mode.take());
+    drop(events_rx);
+    for task in &connection_tasks {
+        task.abort();
+    }
+    for shell in shells.iter().flatten().filter(|shell| shell.open) {
+        let _ = shell.commands.send(MultiplexCommand::Shutdown).await;
+    }
+    for shell in shells.iter_mut().flatten() {
+        if let Some(task) = shell.task.take() {
+            let _ = task.await;
+        }
+        if let Err(error) = shell.session.disconnect().await {
+            tracing::debug!(%error, target = %shell.label, "multiplexed session did not disconnect cleanly");
+        }
+    }
+
+    Ok(CommandExit {
+        code: last_code,
+        signal: last_signal,
+    })
+}
+
+async fn prepare_multiplexed_shell(
+    index: usize,
+    label: String,
+    session: Arc<SshSession>,
+    events: mpsc::Sender<MultiplexEvent>,
+) -> Result<MultiplexedShell> {
+    let bootstrap = session.prepare_agent(true).await?;
+    let cleanup = ProgressiveCleanup {
+        remote_session_dir: bootstrap.remote_session_dir.clone(),
+        remote_executable: bootstrap.remote_executable.clone(),
+        session_id: bootstrap.session_id.clone(),
+    };
+    let shell_launcher = bootstrap.shell_launcher.clone();
+    let channel = session.session.channel_open_session().await?;
+    let term = env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned());
+    let (columns, rows) = terminal_size();
+    channel
+        .request_pty(true, &term, columns, rows, 0, 0, &[])
+        .await?;
+    let command = build_shell_command(session.target.path.as_deref(), Some(&shell_launcher));
+    channel.exec(true, command).await?;
+
+    let (commands, command_rx) = mpsc::channel(64);
+    let (start, start_rx) = oneshot::channel();
+    let actor_session = Arc::clone(&session);
+    let task = tokio::spawn(async move {
+        run_multiplexed_shell_actor(
+            index,
+            actor_session,
+            channel,
+            bootstrap,
+            cleanup,
+            command_rx,
+            start_rx,
+            events,
+        )
+        .await;
+    });
+    Ok(MultiplexedShell {
+        label,
+        session,
+        commands,
+        start: Some(start),
+        task: Some(task),
+        replay: ReplayBuffer::default(),
+        open: true,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_multiplexed_shell_actor(
+    index: usize,
+    session: Arc<SshSession>,
+    mut channel: russh::Channel<client::Msg>,
+    bootstrap: AgentBootstrap,
+    cleanup: ProgressiveCleanup,
+    mut commands: mpsc::Receiver<MultiplexCommand>,
+    start: oneshot::Receiver<()>,
+    events: mpsc::Sender<MultiplexEvent>,
+) {
+    if start.await.is_err() {
+        let _ = channel.close().await;
+        let _ = session.cleanup_progressive_session(&cleanup).await;
+        return;
+    }
+    let mut startup: Option<AgentStartup<'_>> =
+        Some(Box::pin(session.finish_agent(bootstrap, true)));
+    let mut agent = None;
+    let mut code = None;
+    let mut signal = None;
+
+    'shell: loop {
+        tokio::select! {
+            command = commands.recv() => {
+                match command {
+                    Some(MultiplexCommand::Input(data)) => {
+                        if channel.data_bytes(data).await.is_err() {
+                            break 'shell;
+                        }
+                    }
+                    Some(MultiplexCommand::Eof) => {
+                        let _ = channel.eof().await;
+                    }
+                    Some(MultiplexCommand::Resize(columns, rows)) => {
+                        let _ = channel.window_change(columns, rows, 0, 0).await;
+                    }
+                    Some(MultiplexCommand::ControlResponse(response)) => {
+                        if let Some(remote_agent) = agent.as_mut()
+                            && remote_agent.respond(response).await.is_err()
+                        {
+                            agent = None;
+                        }
+                    }
+                    Some(MultiplexCommand::Shutdown) | None => break 'shell,
+                }
+            }
+            message = channel.wait() => {
+                let Some(message) = message else { break 'shell };
+                match message {
+                    ChannelMsg::Data { data } | ChannelMsg::ExtendedData { data, .. } => {
+                        if events
+                            .send(MultiplexEvent::Output { index, data: data.to_vec() })
+                            .await
+                            .is_err()
+                        {
+                            break 'shell;
+                        }
+                    }
+                    ChannelMsg::ExitStatus { exit_status } => {
+                        code = Some(exit_status);
+                        break 'shell;
+                    }
+                    ChannelMsg::ExitSignal { signal_name, .. } => {
+                        signal = Some(format!("{signal_name:?}"));
+                        break 'shell;
+                    }
+                    ChannelMsg::Close => break 'shell,
+                    _ => {}
+                }
+            }
+            startup_result = receive_agent_startup(&mut startup), if startup.is_some() => {
+                startup = None;
+                match startup_result {
+                    Ok(started_agent) => agent = Some(started_agent),
+                    Err(error) => {
+                        if let Err(mark_error) = session
+                            .write_agent_startup_error(&cleanup.remote_session_dir, &error)
+                            .await
+                        {
+                            tracing::debug!(%mark_error, "could not write multiplexed worker error marker");
+                        }
+                        let _ = events
+                            .send(MultiplexEvent::WorkerNotice {
+                                index,
+                                message: format!("worker unavailable: {error}"),
+                            })
+                            .await;
+                    }
+                }
+            }
+            request = receive_control_request(&mut agent) => {
+                match request {
+                    Ok(request) => {
+                        if events
+                            .send(MultiplexEvent::ControlRequest { index, request })
+                            .await
+                            .is_err()
+                        {
+                            break 'shell;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = events
+                            .send(MultiplexEvent::WorkerNotice {
+                                index,
+                                message: format!("remote worker stopped: {error}"),
+                            })
+                            .await;
+                        agent = None;
+                    }
+                }
+            }
+        }
+    }
+
+    drop(startup.take());
+    let _ = channel.close().await;
+    if let Some(agent) = agent.as_mut() {
+        let _ = agent.shutdown().await;
+    }
+    if let Err(error) = session.cleanup_progressive_session(&cleanup).await {
+        tracing::debug!(%error, "could not clean multiplexed worker session");
+    }
+    let _ = events
+        .send(MultiplexEvent::Exited {
+            index,
+            code,
+            signal,
+        })
+        .await;
+}
+
+fn start_multiplexed_shell(shell: &mut MultiplexedShell) {
+    if let Some(start) = shell.start.take() {
+        let _ = start.send(());
+    }
+}
+
+fn active_shell_commands(
+    shells: &[Option<MultiplexedShell>],
+    active: Option<usize>,
+) -> Option<mpsc::Sender<MultiplexCommand>> {
+    shells
+        .get(active?)?
+        .as_ref()
+        .filter(|shell| shell.open)
+        .map(|shell| shell.commands.clone())
+}
+
+fn adjacent_open_shell(
+    shells: &[Option<MultiplexedShell>],
+    current: usize,
+    action: InputAction,
+) -> Option<usize> {
+    (1..shells.len())
+        .map(|distance| match action {
+            InputAction::Next => (current + distance) % shells.len(),
+            InputAction::Previous => (current + shells.len() - distance) % shells.len(),
+        })
+        .find(|index| shells[*index].as_ref().is_some_and(|shell| shell.open))
+}
+
+async fn render_multiplexed_shell(
+    stdout: &mut tokio::io::Stdout,
+    shell: &Option<MultiplexedShell>,
+    index: usize,
+    total: usize,
+) -> Result<()> {
+    let shell = shell.as_ref().expect("rendered shell must exist");
+    let label = display_label(&shell.label);
+    stdout
+        .write_all(
+            format!(
+                "\x1b]0;sshai [{}/{}] {label}\x07\x1b[2J\x1b[H",
+                index + 1,
+                total
+            )
+            .as_bytes(),
+        )
+        .await?;
+    stdout
+        .write_all(
+            format!(
+                "\x1b[1;36m[sshai {}/{}] {label} — Ctrl+Shift+←/→ switches hosts\x1b[0m\r\n",
+                index + 1,
+                total
+            )
+            .as_bytes(),
+        )
+        .await?;
+    for chunk in &shell.replay.chunks {
+        stdout.write_all(chunk).await?;
+    }
+    stdout.flush().await?;
+    Ok(())
+}
+
+async fn write_multiplexer_status(
+    stdout: &mut tokio::io::Stdout,
+    pending: usize,
+    statuses: &[String],
+) -> Result<()> {
+    let failed = statuses
+        .iter()
+        .filter(|status| status.starts_with("failed:"))
+        .count();
+    stdout
+        .write_all(
+            format!(
+                "\r\n\x1b[1;33m[sshai] no other connected host ({pending} connecting, {failed} failed)\x1b[0m\r\n"
+            )
+            .as_bytes(),
+        )
+        .await?;
+    for (index, status) in statuses
+        .iter()
+        .enumerate()
+        .filter(|(_, status)| status.starts_with("failed:"))
+    {
+        stdout
+            .write_all(format!("  {}: {status}\r\n", index + 1).as_bytes())
+            .await?;
+    }
+    stdout.flush().await?;
+    Ok(())
+}
+
+fn display_label(label: &str) -> String {
+    label
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect()
 }
 
 fn build_command(path: Option<&str>, arguments: &[String]) -> String {
@@ -1437,7 +2143,8 @@ Agent names after --agent are resolved on the local machine. Known agents use bu
 other executables must advertise MCP support and receive the generic MCP environment.\n\
 These commands run through the encrypted session control channel. LOCAL_KEY is\n\
 read on your local machine; quote paths containing '~' to prevent the remote\n\
-shell from expanding them first, for example: sshai copy-id -i '~/.ssh/id_ed25519.pub'\n"
+shell from expanding them first, for example: sshai copy-id -i '~/.ssh/id_ed25519.pub'\n\
+In a multi-host session, use Ctrl+Shift+Left/Right to switch the active host.\n"
 }
 
 fn parse_copy_id_arguments(arguments: &[String]) -> Result<(Option<PathBuf>, Option<String>)> {
@@ -1751,5 +2458,45 @@ mod tests {
         .unwrap();
         assert_eq!(identity, Some(PathBuf::from("/tmp/local key.pub")));
         assert_eq!(authorized_keys.as_deref(), Some(".ssh/custom_keys"));
+    }
+
+    #[test]
+    fn parses_split_multi_host_switch_sequences_without_forwarding_them() {
+        let mut parser = SwitchInputParser::default();
+        let first = parser.feed(b"echo ok\n\x1b[1;");
+        assert!(matches!(first.as_slice(), [ParsedInput::Data(data)] if data == b"echo ok\n"));
+        assert!(parser.has_pending());
+
+        let second = parser.feed(b"6Ctail");
+        assert!(matches!(
+            second.as_slice(),
+            [ParsedInput::Switch(InputAction::Next), ParsedInput::Data(data)] if data == b"tail"
+        ));
+        assert!(!parser.has_pending());
+
+        assert!(matches!(
+            parser.feed(SWITCH_PREVIOUS).as_slice(),
+            [ParsedInput::Switch(InputAction::Previous)]
+        ));
+    }
+
+    #[test]
+    fn forwards_incomplete_escape_sequence_after_timeout() {
+        let mut parser = SwitchInputParser::default();
+        assert!(parser.feed(b"\x1b").is_empty());
+        assert_eq!(parser.flush().as_deref(), Some(b"\x1b".as_slice()));
+    }
+
+    #[test]
+    fn bounds_multi_host_terminal_replay() {
+        let mut replay = ReplayBuffer::default();
+        replay.push(&vec![b'a'; SHELL_REPLAY_LIMIT]);
+        replay.push(b"tail");
+
+        assert!(replay.bytes <= SHELL_REPLAY_LIMIT + 4);
+        assert_eq!(
+            replay.chunks.back().map(Vec::as_slice),
+            Some(b"tail".as_slice())
+        );
     }
 }

@@ -33,7 +33,7 @@ pub(crate) async fn authenticate(
         if !path.is_file() {
             continue;
         }
-        match authenticate_key_file(session, target, path).await {
+        match authenticate_key_file(session, target, path, allow_password).await {
             Ok(true) => return Ok(format!("key {}", path.display())),
             Ok(false) => attempts.push(format!("key {}: rejected", path.display())),
             Err(error) => attempts.push(format!("key {}: {error}", path.display())),
@@ -135,10 +135,11 @@ async fn authenticate_key_file(
     session: &mut client::Handle<ClientHandler>,
     target: &ResolvedTarget,
     path: &Path,
+    allow_prompt: bool,
 ) -> Result<bool> {
     let key = match keys::load_secret_key(path, None) {
         Ok(key) => key,
-        Err(keys::Error::KeyIsEncrypted) if std::io::stdin().is_terminal() => {
+        Err(keys::Error::KeyIsEncrypted) if allow_prompt && std::io::stdin().is_terminal() => {
             let display = path.display().to_string();
             let password = tokio::task::spawn_blocking(move || {
                 rpassword::prompt_password(format!("Passphrase for key {display}: "))

@@ -1,0 +1,16 @@
+{
+  "name": "termm-web",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "latest",
+    "@xterm/xterm": "latest"
+  },
+  "devDependencies": {
+    "typescript": "latest",
+    "vite": "latest"
+  }
+}

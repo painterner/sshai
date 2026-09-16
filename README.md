@@ -16,6 +16,7 @@
 - 默认启用按会话隔离的远端 agent、Unix socket 和 `sshai` shim
 - 独立 SSH 控制 Channel，远端内置命令同步调用本地能力
 - 本地 stdio MCP Server，将远端工作区暴露给 AI CLI
+- MCP SSH 断线自动重连；只读调用安全重试，状态不确定的写操作不重复执行
 - `sshai --agent codex TARGET` 一次性注入 MCP 配置，本地 Codex 登录态无需迁移
 - `sshai --agent claude TARGET` 一次性注入 MCP 配置，本地 Claude 登录态无需迁移
 - `sshai agent` 内置本地模型循环，共用 MCP 的远程工具与审批边界
@@ -38,9 +39,19 @@ target/release/sshai-worker
 
 ```bash
 cargo install --locked --path crates/sshai-cli --force
+cargo install --locked --path termm --force
 ```
 
-该命令会同时安装 `sshai` 和 `sshai-worker`。确保 `~/.cargo/bin` 已加入 `PATH`；随后用 `sshai --version` 验证。
+第一条命令会同时安装 `sshai` 和 `sshai-worker`，第二条安装 `termm`。确保 `~/.cargo/bin` 已加入 `PATH`；随后用 `sshai --version` 验证。
+
+`termm` 是独立子工程和二进制，提供 sshai 原生的标签页、点击新建、横纵分屏和 broker-owned PTY：
+
+```bash
+termm
+termm build-server,test-server --cwd ~/projects/app
+```
+
+每次启动只监听 loopback，并使用随机访问令牌保护本地 API/WebSocket。New 与 Split 会继承启动时的 targets、本地 cwd 和 sshai 配置；浏览器刷新不会结束 Shell，异常退出的远端 sshai transport 会在同一 pane 内自动拉起。详见 [`termm/README.md`](termm/README.md)。
 
 ## 使用
 
@@ -52,6 +63,10 @@ sshai user@example.com:/srv/project
 sshai ssh://user@example.com:2222/srv/project
 sshai build-server,test-server,prod-server
 ```
+
+多主机形式会先连接并立即打开第一台主机的 Shell，不等待其他主机。其余主机在后台并行完成连接、PTY 和 worker 启动；连接成功后可用 `Ctrl+Shift+←` / `Ctrl+Shift+→` 在仍然存活的主机之间循环切换。每台主机保留独立的 Shell、当前目录和前台程序，后台输出不会混入当前屏幕；切回时会用每台主机最近最多 4 MiB 的终端输出重建画面。
+
+后台连接不会读取密码、私钥口令、keyboard-interactive 或未知主机确认，以免抢占已经交给第一台主机的键盘。应预先使用 SSH Agent、公钥和 `known_hosts`；某台后台主机失败不会影响其他主机，按切换键且没有其他可用主机时会显示连接中及失败状态。
 
 交互式 Shell 默认会：
 
@@ -79,13 +94,13 @@ sshai copy-id -i '~/.ssh/id_ed25519.pub'
 
 会话内执行 `sshai --agent codex` 或 `sshai --agent claude` 会把终端临时交给对应的本机 AI CLI。本机启动 `sshai` 时的目录是可读写的 local 工作区，远端 Shell 的当前目录是 primary remote 工作区；AI CLI 退出后回到原远端 Shell。可用 `sshai --agent codex --local-dir '/本机/其他目录'` 覆盖 local 目录；请引用路径，避免先被远端 Shell 展开。
 
-逗号分隔的目标会建立一个本机 + 多远端 AI 会话。交互 Shell 位于第一个目标，后续 `sshai --agent NAME` 会把所有目标分别注入为具名 MCP 工作区：
+逗号分隔的目标会建立一个本机 + 多远端 AI 会话。交互 Shell 从第一个目标立即开始，其他目标连接完成后可切换；任意主机内的 `sshai --agent NAME` 都会把当前主机作为 primary remote，并将所有目标分别注入为具名 MCP 工作区：
 
 ```bash
 cd ~/projects/control-plane
 sshai build-server,test-server,prod-server
 
-# 在 build-server 的 Shell 中执行；三个远端都可独立读写和执行
+# 在任一主机的 Shell 中执行；三个远端都可独立读写和执行
 sshai --agent codex
 ```
 
@@ -169,6 +184,12 @@ MCP 提供 `workspace_info/list/stat/read/hash/write/edit/mkdir/rename/remove/ex
 多 remote 之间可以由 AI 明确使用一个 local 临时路径中转。传输支持 `exclude` 名称或相对子树过滤，并限制单次最多 100,000 个文件系统条目。写文件使用同目录临时文件、`fsync` 和原子 rename；编辑会自动以读取内容的 BLAKE3 作为乐观并发条件。
 
 stdio MCP 的 stdin/stdout 专用于 JSON-RPC，不能用于 SSH 密码交互。建议先运行 `sshai copy-id HOST` 配置公钥认证。
+
+MCP Server 每 15 秒在空闲连接上进行一次 workspace 心跳，SSH、worker 或 SFTP channel 断开后会原地重建完整连接，Codex、Claude、Gemini 等本机 Agent 无需退出。重连无限持续，采用从 250 ms 增长到最多 30 秒并带 ±25% 随机抖动的指数退避。一个目标只有一个连接管理器；重连期间到达的工具调用进入同一个串行队列，最多等待 45 秒，超时后重连仍在后台继续。
+
+`workspace_info/list/stat/read/hash` 如果在传输中断开，会保留在队列并在新连接上安全重试。写入、编辑、删除、命令执行和文件传输可能已经在断线前生效，因此不会自动重复；sshai 会要求 Agent 先检查远端状态。`workspace_connection_info` 不依赖远端，在离线期间仍可报告连接阶段、连接代数、累计重连、队列深度、心跳、下次重试时间和最近错误。所有诊断只写 stderr，不污染 MCP JSON-RPC。
+
+原生可恢复 Terminal 的设计见 [`docs/terminal.md`](docs/terminal.md)：前端负责标签页、点击新建和分屏，远端 `sshai-worker` 负责持久 PTY、输出序列和断线重附着。这会提供 tmux 的核心持久性，但不要求用户学习 tmux 命令。
 
 运行 sshai 自己的内置 Agent：
 

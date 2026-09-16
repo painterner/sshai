@@ -8,6 +8,7 @@ members = [
     "crates/sshai-mcp",
     "crates/sshai-ai",
     "crates/sshai-cli",
+    "termm",
 ]
 resolver = "3"
 
@@ -20,6 +21,7 @@ rust-version = "1.85"
 [workspace.dependencies]
 anyhow = "1"
 async-trait = "0.1"
+axum = { version = "0.8", features = ["ws"] }
 base64 = "0.22"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
