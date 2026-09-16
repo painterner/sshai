@@ -1,8 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
     fs::File,
-    io::Read,
-    net::SocketAddr,
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::process::ExitStatusExt,
@@ -17,17 +15,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, anyhow, bail};
-use axum::{
-    Json, Router,
-    body::Body,
-    extract::{
-        Path, Query, State,
-        ws::{Message, WebSocket, WebSocketUpgrade},
-    },
-    http::{HeaderMap, StatusCode, header},
-    response::{Html, IntoResponse, Response},
-    routing::{delete, get},
-};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use clap::Parser;
 use nix::{
@@ -36,18 +23,15 @@ use nix::{
     unistd::Pid,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::json;
+use tauri::{Emitter, State};
 use tokio::{
     io::unix::AsyncFd,
     process::Command,
-    sync::{Mutex, RwLock, broadcast, mpsc},
+    sync::{Mutex, RwLock, mpsc},
 };
 use tracing_subscriber::EnvFilter;
 
 const HISTORY_LIMIT: usize = 4 * 1024 * 1024;
-const INDEX_HTML: &str = include_str!("../assets/index.html");
-const APP_JS: &[u8] = include_bytes!("../assets/app.js");
-const APP_CSS: &[u8] = include_bytes!("../assets/app.css");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -63,23 +47,14 @@ struct Cli {
     #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
 
-    /// Address for the local-only UI server.
-    #[arg(long, default_value = "127.0.0.1:7636")]
-    bind: SocketAddr,
-
     /// sshai executable launched inside remote panes.
     #[arg(long, default_value = "sshai")]
     sshai: PathBuf,
-
-    /// Do not open the UI in the system browser.
-    #[arg(long)]
-    no_open: bool,
 }
 
 #[derive(Clone)]
 struct AppState {
     context: TermmContext,
-    token: String,
     sessions: Arc<RwLock<HashMap<String, Arc<TerminalSession>>>>,
     next_id: Arc<AtomicU64>,
 }
@@ -92,9 +67,9 @@ struct TermmContext {
 }
 
 struct TerminalSession {
+    app: tauri::AppHandle,
     info: RwLock<SessionInfo>,
     control: mpsc::Sender<PtyControl>,
-    events: broadcast::Sender<SessionEvent>,
     history: Mutex<History>,
 }
 
@@ -115,12 +90,6 @@ struct SessionInfo {
 struct OutputChunk {
     sequence: u64,
     data: Vec<u8>,
-}
-
-#[derive(Clone, Debug)]
-enum SessionEvent {
-    Output(OutputChunk),
-    Status(SessionInfo),
 }
 
 #[derive(Default)]
@@ -177,22 +146,49 @@ struct CreateResponse {
     session: SessionInfo,
 }
 
-#[derive(Debug, Deserialize)]
-struct AttachQuery {
-    after: Option<u64>,
-    token: String,
+#[derive(Clone, Debug, Serialize)]
+struct OutputMessage {
+    sequence: u64,
+    data_base64: String,
 }
 
-#[derive(Debug, Deserialize)]
+impl From<&OutputChunk> for OutputMessage {
+    fn from(chunk: &OutputChunk) -> Self {
+        Self {
+            sequence: chunk.sequence,
+            data_base64: BASE64.encode(&chunk.data),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct SessionSnapshot {
+    session: SessionInfo,
+    output: Vec<OutputMessage>,
+}
+
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-enum ClientMessage {
-    Resize { columns: u16, rows: u16 },
-    Signal { signal: String },
-    Terminate,
+enum FrontendSessionEvent {
+    Output {
+        session_id: String,
+        sequence: u64,
+        data_base64: String,
+    },
+    Status {
+        session_id: String,
+        session: SessionInfo,
+    },
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() {
+    if let Err(error) = run_app() {
+        eprintln!("termm: {error:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run_app() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("termm=info")),
@@ -200,12 +196,6 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    if !cli.bind.ip().is_loopback() {
-        bail!(
-            "termm UI must bind to a loopback address, not {}",
-            cli.bind.ip()
-        );
-    }
     let cwd = cli
         .cwd
         .unwrap_or(std::env::current_dir().context("cannot determine current directory")?)
@@ -218,66 +208,35 @@ async fn main() -> Result<()> {
     };
     let state = AppState {
         context,
-        token: random_token()?,
         sessions: Arc::new(RwLock::new(HashMap::new())),
         next_id: Arc::new(AtomicU64::new(1)),
     };
-    let app = Router::new()
-        .route("/", get(index))
-        .route("/app.js", get(app_js))
-        .route("/app.css", get(app_css))
-        .route("/api/context", get(get_context))
-        .route("/api/sessions", get(list_sessions).post(create_session))
-        .route("/api/sessions/{id}", delete(terminate_session))
-        .route("/api/sessions/{id}/ws", get(attach_session))
-        .with_state(state.clone());
-    let listener = tokio::net::TcpListener::bind(cli.bind).await?;
-    let address = listener.local_addr()?;
-    let url = format!("http://{address}/?token={}", state.token);
-    eprintln!("termm: {url}");
-    if !cli.no_open {
-        open_browser(&url);
-    }
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    tauri::Builder::default()
+        .manage(state)
+        .invoke_handler(tauri::generate_handler![
+            get_context,
+            list_sessions,
+            create_session,
+            session_snapshot,
+            terminal_input,
+            terminal_resize,
+            terminal_signal,
+            terminate_session,
+        ])
+        .run(tauri::generate_context!())
+        .context("cannot run the termm desktop application")?;
     Ok(())
 }
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+#[tauri::command]
+fn get_context(state: State<'_, AppState>) -> TermmContext {
+    state.context.clone()
 }
 
-async fn app_js() -> Response {
-    static_response(APP_JS, "text/javascript; charset=utf-8")
-}
-
-async fn app_css() -> Response {
-    static_response(APP_CSS, "text/css; charset=utf-8")
-}
-
-fn static_response(bytes: &'static [u8], content_type: &'static str) -> Response {
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(header::CONTENT_TYPE, content_type)
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(bytes))
-        .expect("static response is valid")
-}
-
-async fn get_context(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<TermmContext>, ApiError> {
-    authorize(&state, &headers)?;
-    Ok(Json(state.context))
-}
-
+#[tauri::command]
 async fn list_sessions(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<Vec<SessionInfo>>, ApiError> {
-    authorize(&state, &headers)?;
+    state: State<'_, AppState>,
+) -> std::result::Result<Vec<SessionInfo>, String> {
     let sessions = state
         .sessions
         .read()
@@ -290,15 +249,25 @@ async fn list_sessions(
         values.push(session.info.read().await.clone());
     }
     values.sort_by_key(|session| session.created_unix_ms);
-    Ok(Json(values))
+    Ok(values)
 }
 
+#[tauri::command]
 async fn create_session(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(request): Json<CreateSession>,
-) -> Result<Json<CreateResponse>, ApiError> {
-    authorize(&state, &headers)?;
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+    request: CreateSession,
+) -> std::result::Result<CreateResponse, String> {
+    create_session_inner(app, &state, request)
+        .await
+        .map_err(command_error)
+}
+
+async fn create_session_inner(
+    app: tauri::AppHandle,
+    state: &AppState,
+    request: CreateSession,
+) -> Result<CreateResponse> {
     let target = request
         .target
         .or_else(|| state.context.default_target.clone());
@@ -309,11 +278,10 @@ async fn create_session(
         .canonicalize()
         .with_context(|| format!("cannot open local working directory {cwd}"))?;
     if !cwd.is_dir() {
-        return Err(anyhow!(
+        bail!(
             "local working directory is not a directory: {}",
             cwd.display()
-        )
-        .into());
+        );
     }
     let sequence = state.next_id.fetch_add(1, Ordering::Relaxed);
     let id = format!("{:x}-{sequence:x}", now_unix_ms());
@@ -332,11 +300,10 @@ async fn create_session(
         last_sequence: 0,
     };
     let (control, control_rx) = mpsc::channel(128);
-    let (events, _) = broadcast::channel(256);
     let session = Arc::new(TerminalSession {
+        app,
         info: RwLock::new(info.clone()),
         control,
-        events,
         history: Mutex::new(History::default()),
     });
     state
@@ -353,156 +320,108 @@ async fn create_session(
         request.rows.unwrap_or(30).max(2),
         control_rx,
     ));
-    Ok(Json(CreateResponse { session: info }))
+    Ok(CreateResponse { session: info })
 }
 
+#[tauri::command]
 async fn terminate_session(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
-    authorize(&state, &headers)?;
+    state: State<'_, AppState>,
+    id: String,
+) -> std::result::Result<(), String> {
+    send_control(&state, &id, PtyControl::Terminate).await
+}
+
+#[tauri::command]
+async fn session_snapshot(
+    state: State<'_, AppState>,
+    id: String,
+    after: u64,
+) -> std::result::Result<SessionSnapshot, String> {
     let session = state
         .sessions
         .read()
         .await
         .get(&id)
         .cloned()
-        .ok_or_else(|| ApiError::not_found(format!("unknown terminal session {id}")))?;
+        .ok_or_else(|| format!("unknown terminal session {id}"))?;
+    let info = session.info.read().await.clone();
+    let output = session
+        .history
+        .lock()
+        .await
+        .after(after)
+        .iter()
+        .map(OutputMessage::from)
+        .collect();
+    Ok(SessionSnapshot {
+        session: info,
+        output,
+    })
+}
+
+#[tauri::command]
+async fn terminal_input(
+    state: State<'_, AppState>,
+    id: String,
+    data: Vec<u8>,
+) -> std::result::Result<(), String> {
+    send_control(&state, &id, PtyControl::Input(data)).await
+}
+
+#[tauri::command]
+async fn terminal_resize(
+    state: State<'_, AppState>,
+    id: String,
+    columns: u16,
+    rows: u16,
+) -> std::result::Result<(), String> {
+    send_control(
+        &state,
+        &id,
+        PtyControl::Resize {
+            columns: columns.max(2),
+            rows: rows.max(2),
+        },
+    )
+    .await
+}
+
+#[tauri::command]
+async fn terminal_signal(
+    state: State<'_, AppState>,
+    id: String,
+    signal: String,
+) -> std::result::Result<(), String> {
+    let signal = match signal.as_str() {
+        "interrupt" => Signal::SIGINT,
+        "terminate" => Signal::SIGTERM,
+        "kill" => Signal::SIGKILL,
+        _ => return Err(format!("unsupported terminal signal {signal}")),
+    };
+    send_control(&state, &id, PtyControl::Signal(signal)).await
+}
+
+async fn send_control(
+    state: &AppState,
+    id: &str,
+    control: PtyControl,
+) -> std::result::Result<(), String> {
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(id)
+        .cloned()
+        .ok_or_else(|| format!("unknown terminal session {id}"))?;
     session
         .control
-        .send(PtyControl::Terminate)
+        .send(control)
         .await
-        .map_err(|_| anyhow!("terminal session has already stopped"))?;
-    Ok(StatusCode::ACCEPTED)
+        .map_err(|_| "terminal session has already stopped".to_owned())
 }
 
-async fn attach_session(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Query(query): Query<AttachQuery>,
-    upgrade: WebSocketUpgrade,
-) -> Result<impl IntoResponse, ApiError> {
-    if query.token != state.token {
-        return Err(ApiError::unauthorized());
-    }
-    let session = state
-        .sessions
-        .read()
-        .await
-        .get(&id)
-        .cloned()
-        .ok_or_else(|| ApiError::not_found(format!("unknown terminal session {id}")))?;
-    Ok(
-        upgrade
-            .on_upgrade(move |socket| terminal_socket(socket, session, query.after.unwrap_or(0))),
-    )
-}
-
-async fn terminal_socket(mut socket: WebSocket, session: Arc<TerminalSession>, after: u64) {
-    let mut events = session.events.subscribe();
-    let info = session.info.read().await.clone();
-    if send_status(&mut socket, &info).await.is_err() {
-        return;
-    }
-    let history = session.history.lock().await.after(after);
-    let mut delivered = after;
-    for chunk in history {
-        delivered = delivered.max(chunk.sequence);
-        if send_output(&mut socket, &chunk).await.is_err() {
-            return;
-        }
-    }
-    loop {
-        tokio::select! {
-            incoming = socket.recv() => {
-                match incoming {
-                    Some(Ok(Message::Binary(data))) => {
-                        if session.control.send(PtyControl::Input(data.to_vec())).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Text(text))) => {
-                        let Ok(message) = serde_json::from_str::<ClientMessage>(&text) else {
-                            continue;
-                        };
-                        let control = match message {
-                            ClientMessage::Resize { columns, rows } => PtyControl::Resize {
-                                columns: columns.max(2),
-                                rows: rows.max(2),
-                            },
-                            ClientMessage::Signal { signal } => match signal.as_str() {
-                                "interrupt" => PtyControl::Signal(Signal::SIGINT),
-                                "terminate" => PtyControl::Signal(Signal::SIGTERM),
-                                "kill" => PtyControl::Signal(Signal::SIGKILL),
-                                _ => continue,
-                            },
-                            ClientMessage::Terminate => PtyControl::Terminate,
-                        };
-                        if session.control.send(control).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Close(_))) | None | Some(Err(_)) => break,
-                    Some(Ok(Message::Ping(data))) => {
-                        if socket.send(Message::Pong(data)).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(Message::Pong(_))) => {}
-                }
-            }
-            event = events.recv() => {
-                match event {
-                    Ok(SessionEvent::Output(chunk)) if chunk.sequence > delivered => {
-                        delivered = chunk.sequence;
-                        if send_output(&mut socket, &chunk).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(SessionEvent::Output(_)) => {}
-                    Ok(SessionEvent::Status(info)) => {
-                        if send_status(&mut socket, &info).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let info = session.info.read().await.clone();
-                        if send_status(&mut socket, &info).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-    }
-}
-
-async fn send_output(socket: &mut WebSocket, chunk: &OutputChunk) -> Result<()> {
-    socket
-        .send(Message::Text(
-            json!({
-                "type": "output",
-                "sequence": chunk.sequence,
-                "data_base64": BASE64.encode(&chunk.data),
-            })
-            .to_string()
-            .into(),
-        ))
-        .await?;
-    Ok(())
-}
-
-async fn send_status(socket: &mut WebSocket, info: &SessionInfo) -> Result<()> {
-    socket
-        .send(Message::Text(
-            json!({"type": "status", "session": info})
-                .to_string()
-                .into(),
-        ))
-        .await?;
-    Ok(())
+fn command_error(error: anyhow::Error) -> String {
+    format!("{error:#}")
 }
 
 async fn run_pty(
@@ -680,7 +599,15 @@ async fn publish_output(session: &TerminalSession, data: Vec<u8>) {
     };
     let chunk = OutputChunk { sequence, data };
     session.history.lock().await.push(chunk.clone());
-    let _ = session.events.send(SessionEvent::Output(chunk));
+    let id = session.info.read().await.id.clone();
+    let _ = session.app.emit(
+        "session-event",
+        FrontendSessionEvent::Output {
+            session_id: id,
+            sequence: chunk.sequence,
+            data_base64: BASE64.encode(&chunk.data),
+        },
+    );
 }
 
 async fn update_phase(
@@ -696,7 +623,13 @@ async fn update_phase(
         info.signal = signal;
         info.clone()
     };
-    let _ = session.events.send(SessionEvent::Status(info));
+    let _ = session.app.emit(
+        "session-event",
+        FrontendSessionEvent::Status {
+            session_id: info.id.clone(),
+            session: info,
+        },
+    );
 }
 
 async fn read_pty(master: &AsyncFd<OwnedFd>, buffer: &mut [u8]) -> Result<usize> {
@@ -783,82 +716,6 @@ fn now_unix_ms() -> u64 {
             .as_millis(),
     )
     .unwrap_or(u64::MAX)
-}
-
-fn random_token() -> Result<String> {
-    let mut bytes = [0_u8; 32];
-    File::open("/dev/urandom")?.read_exact(&mut bytes)?;
-    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
-fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let authorized = headers
-        .get("x-termm-token")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value == state.token);
-    if authorized {
-        Ok(())
-    } else {
-        Err(ApiError::unauthorized())
-    }
-}
-
-fn open_browser(url: &str) {
-    let command = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    if let Err(error) = std::process::Command::new(command).arg(url).spawn() {
-        tracing::warn!(%error, "could not open the termm UI automatically");
-    }
-}
-
-async fn shutdown_signal() {
-    let _ = tokio::signal::ctrl_c().await;
-}
-
-struct ApiError {
-    status: StatusCode,
-    error: anyhow::Error,
-}
-
-impl ApiError {
-    fn not_found(message: String) -> Self {
-        Self {
-            status: StatusCode::NOT_FOUND,
-            error: anyhow!(message),
-        }
-    }
-
-    fn unauthorized() -> Self {
-        Self {
-            status: StatusCode::UNAUTHORIZED,
-            error: anyhow!("missing or invalid termm access token"),
-        }
-    }
-}
-
-impl<E> From<E> for ApiError
-where
-    E: Into<anyhow::Error>,
-{
-    fn from(error: E) -> Self {
-        Self {
-            status: StatusCode::BAD_REQUEST,
-            error: error.into(),
-        }
-    }
-}
-
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
-        (
-            self.status,
-            Json(json!({"error": format!("{:#}", self.error)})),
-        )
-            .into_response()
-    }
 }
 
 #[cfg(test)]

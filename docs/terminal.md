@@ -2,7 +2,7 @@
 
 ## Current implementation
 
-The top-level `termm/` project now provides the first runnable layer: a loopback-only Rust broker, random API token, broker-owned local PTYs, xterm.js UI, tabs, horizontal/vertical splits, context inheritance, bounded sequence replay, browser reattachment, saved layouts, and abnormal sshai transport relaunch. Its local API and UI use the same session/replay concepts defined below.
+The top-level `termm/` project now provides the first runnable layer: a Tauri desktop process, broker-owned local PTYs, xterm.js UI, tabs, horizontal/vertical splits, context inheritance, bounded sequence replay, pane reattachment, saved layouts, and abnormal sshai transport relaunch. Rust commands and frontend events communicate over Tauri IPC, so there is no external browser process, local HTTP listener, WebSocket, browser profile, or bearer token. Its IPC layer uses the same session/replay concepts defined below.
 
 The remaining persistence boundary is remote: today a transport relaunch creates a new remote shell because the original PTY still belongs to the failed SSH channel. The persistent worker protocol below is required before processes survive a complete SSH transport loss or a `termm` broker restart.
 

@@ -51,7 +51,7 @@ termm
 termm build-server,test-server --cwd ~/projects/app
 ```
 
-每次启动只监听 loopback，并使用随机访问令牌保护本地 API/WebSocket。New 与 Split 会继承启动时的 targets、本地 cwd 和 sshai 配置；浏览器刷新不会结束 Shell，异常退出的远端 sshai transport 会在同一 pane 内自动拉起。详见 [`termm/README.md`](termm/README.md)。
+`termm` 现在直接启动 Tauri 桌面窗口，不再启动 Chrome、监听本地 HTTP 端口或创建浏览器 profile。前端通过 Tauri IPC 与 Rust PTY broker 通信；New 与 Split 会继承启动时的 targets、本地 cwd 和 sshai 配置，异常退出的远端 sshai transport 会在同一 pane 内自动拉起。详见 [`termm/README.md`](termm/README.md)。
 
 ## 使用
 

@@ -1,5 +1,8 @@
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
 
@@ -20,6 +23,20 @@ type SessionInfo = {
   signal: number | null;
   last_sequence: number;
 };
+
+type OutputMessage = {
+  sequence: number;
+  data_base64: string;
+};
+
+type SessionSnapshot = {
+  session: SessionInfo;
+  output: OutputMessage[];
+};
+
+type SessionEvent =
+  | ({ type: "output"; session_id: string } & OutputMessage)
+  | { type: "status"; session_id: string; session: SessionInfo };
 
 type PaneNode = {
   kind: "pane";
@@ -63,13 +80,14 @@ let context: Context;
 const sessions = new Map<string, SessionInfo>();
 const views = new Map<string, PaneView>();
 const app = document.querySelector<HTMLDivElement>("#app")!;
-const accessToken = new URLSearchParams(location.search).get("token") ?? "";
 
 class PaneView {
   readonly terminal: Terminal;
   readonly fit: FitAddon;
-  private socket?: WebSocket;
   private resizeObserver?: ResizeObserver;
+  private inputBuffer = "";
+  private inputTimer?: number;
+  private inputChain: Promise<unknown> = Promise.resolve();
 
   constructor(
     readonly pane: PaneNode,
@@ -114,9 +132,8 @@ class PaneView {
     const mount = element.querySelector<HTMLElement>(".terminal-mount")!;
     this.terminal.open(mount);
     this.terminal.onData((data) => {
-      if (this.socket?.readyState === WebSocket.OPEN) {
-        this.socket.send(new TextEncoder().encode(data));
-      }
+      this.inputBuffer += data;
+      this.inputTimer ??= window.setTimeout(() => this.flushInput(), 3);
     });
     this.terminal.onTitleChange((title) => {
       const titleElement = this.element.querySelector<HTMLElement>(".pane-title");
@@ -124,7 +141,7 @@ class PaneView {
     });
     this.resizeObserver = new ResizeObserver(() => this.resize());
     this.resizeObserver.observe(mount);
-    this.connect();
+    void this.attach();
     requestAnimationFrame(() => this.resize());
   }
 
@@ -133,56 +150,65 @@ class PaneView {
   }
 
   dispose() {
-    this.socket?.close();
+    if (this.inputBuffer) this.flushInput();
+    else window.clearTimeout(this.inputTimer);
     this.resizeObserver?.disconnect();
     this.terminal.dispose();
   }
 
-  private connect() {
-    const protocol = location.protocol === "https:" ? "wss" : "ws";
-    const url = `${protocol}://${location.host}/api/sessions/${encodeURIComponent(this.pane.sessionId)}/ws?after=${this.pane.sequence}&token=${encodeURIComponent(accessToken)}`;
-    const socket = new WebSocket(url);
-    this.socket = socket;
-    socket.onopen = () => {
+  applyEvent(message: SessionEvent) {
+    if (message.type === "output") {
+      if (message.sequence <= this.pane.sequence) return;
+      this.pane.sequence = message.sequence;
+      this.terminal.write(base64Bytes(message.data_base64));
+      scheduleSave();
+    } else {
+      this.updateHeader(message.session);
+    }
+  }
+
+  private async attach() {
+    try {
+      const snapshot = await invoke<SessionSnapshot>("session_snapshot", {
+        id: this.pane.sessionId,
+        after: 0,
+      });
+      sessions.set(snapshot.session.id, snapshot.session);
+      this.updateHeader(snapshot.session);
+      for (const output of snapshot.output) {
+        this.applyEvent({
+          type: "output",
+          session_id: this.pane.sessionId,
+          ...output,
+        });
+      }
       this.setConnectionState("attached");
       this.resize();
-    };
-    socket.onmessage = (event) => {
-      if (typeof event.data !== "string") return;
-      const message = JSON.parse(event.data) as
-        | { type: "output"; sequence: number; data_base64: string }
-        | { type: "status"; session: SessionInfo };
-      if (message.type === "output") {
-        if (message.sequence <= this.pane.sequence) return;
-        this.pane.sequence = message.sequence;
-        this.terminal.write(base64Bytes(message.data_base64));
-        scheduleSave();
-      } else {
-        sessions.set(message.session.id, message.session);
-        this.updateHeader(message.session);
-        refreshStatusbar();
-      }
-    };
-    socket.onclose = () => {
-      this.setConnectionState("detached");
-      window.setTimeout(() => {
-        if (views.get(this.pane.paneId) === this) this.connect();
-      }, 800);
-    };
+    } catch (error) {
+      this.setConnectionState("unavailable");
+      this.terminal.writeln(`\r\n\x1b[31mtermm: ${String(error)}\x1b[0m`);
+    }
+  }
+
+  private flushInput() {
+    this.inputTimer = undefined;
+    const data = this.inputBuffer;
+    this.inputBuffer = "";
+    if (!data) return;
+    const bytes = Array.from(new TextEncoder().encode(data));
+    this.inputChain = this.inputChain
+      .then(() => invoke("terminal_input", { id: this.pane.sessionId, data: bytes }))
+      .catch((error) => this.setConnectionState(String(error)));
   }
 
   private resize() {
     try {
       this.fit.fit();
-      if (this.socket?.readyState === WebSocket.OPEN) {
-        this.socket.send(
-          JSON.stringify({
-            type: "resize",
-            columns: this.terminal.cols,
-            rows: this.terminal.rows,
-          }),
-        );
-      }
+      void invoke("terminal_resize", {
+        id: this.pane.sessionId,
+        columns: this.terminal.cols,
+        rows: this.terminal.rows,
+      }).catch(() => this.setConnectionState("unavailable"));
     } catch {
       // The pane may be between DOM layouts.
     }
@@ -205,8 +231,17 @@ class PaneView {
 }
 
 async function bootstrap() {
-  context = await api<Context>("/api/context");
-  const liveSessions = await api<SessionInfo[]>("/api/sessions");
+  await listen<SessionEvent>("session-event", ({ payload }) => {
+    if (payload.type === "status") {
+      sessions.set(payload.session.id, payload.session);
+      refreshStatusbar();
+    }
+    for (const view of views.values()) {
+      if (view.pane.sessionId === payload.session_id) view.applyEvent(payload);
+    }
+  });
+  context = await invoke<Context>("get_context");
+  const liveSessions = await invoke<SessionInfo[]>("list_sessions");
   liveSessions.forEach((session) => sessions.set(session.id, session));
   const saved = loadState();
   if (saved) Object.assign(state, saved);
@@ -368,7 +403,7 @@ function detachFocused() {
 async function terminateFocused() {
   const pane = focusedPane();
   if (!pane) return;
-  await api<void>(`/api/sessions/${encodeURIComponent(pane.sessionId)}`, { method: "DELETE" });
+  await invoke("terminate_session", { id: pane.sessionId });
   removeFocused(true);
 }
 
@@ -393,15 +428,13 @@ function removeFocused(terminated: boolean) {
 }
 
 async function createBrokerSession(): Promise<SessionInfo> {
-  const response = await api<{ session: SessionInfo }>("/api/sessions", {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
+  const response = await invoke<{ session: SessionInfo }>("create_session", {
+    request: {
       target: state.target || null,
       cwd: state.cwd,
       columns: 100,
       rows: 30,
-    }),
+    },
   });
   sessions.set(response.session.id, response.session);
   return response.session;
@@ -477,20 +510,6 @@ function base64Bytes(value: string) {
   return bytes;
 }
 
-async function api<T>(url: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers);
-  headers.set("x-termm-token", accessToken);
-  const response = await fetch(url, { ...init, headers });
-  if (!response.ok) {
-    const body = await response.json().catch(() => ({ error: response.statusText }));
-    throw new Error(body.error ?? response.statusText);
-  }
-  if (response.status === 204 || response.headers.get("content-length") === "0") {
-    return undefined as T;
-  }
-  return response.json() as Promise<T>;
-}
-
 function escapeHtml(value: string) {
   return value.replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" })[character]!);
 }
@@ -514,6 +533,13 @@ function loadState(): SavedState | null {
   }
 }
 
-bootstrap().catch((error) => {
-  app.innerHTML = `<div class="fatal"><h1>termm failed to start</h1><pre>${escapeHtml(String(error))}</pre></div>`;
-});
+bootstrap()
+  .catch((error) => {
+    app.innerHTML = `<div class="fatal"><h1>termm failed to start</h1><pre>${escapeHtml(String(error))}</pre></div>`;
+  })
+  .finally(async () => {
+    const window = getCurrentWindow();
+    await window.show();
+    await window.setFocus();
+  })
+  .catch((error) => console.error("termm could not reveal its window", error));

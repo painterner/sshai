@@ -6,6 +6,7 @@
     "build": "vite build"
   },
   "dependencies": {
+    "@tauri-apps/api": "^2.8.0",
     "@xterm/addon-fit": "latest",
     "@xterm/xterm": "latest"
   },
