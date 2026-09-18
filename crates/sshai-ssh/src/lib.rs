@@ -17,8 +17,8 @@ pub use config::{HostKeyPolicy, ResolvedTarget, SshConfig};
 pub use error::{Result, SshError};
 pub use identity::{PublicIdentity, discover_public_identities};
 pub use session::{
-    CommandExit, ConnectOptions, SessionCommandHandler, SessionCommandResult, SshConnector,
-    SshSession,
+    CommandExit, ConnectOptions, SessionCommandHandler, SessionCommandResult, SessionInputResult,
+    SshConnector, SshSession,
 };
 pub use sftp::{KeyInstallResult, SftpClient, SftpTransferStats};
 pub use sshai_protocol::{

@@ -18,6 +18,8 @@ The window and broker start in one process. Frontend requests use Tauri IPC, whi
 
 - xterm.js terminal rendering with true color and resize propagation;
 - native Tauri window backed by the operating system WebView;
+- integrated dark title bar with drag, resize, minimize, maximize, and close controls;
+- restored window size, position, and maximized state across launches;
 - New workspace tabs and horizontal/vertical splits;
 - focused-pane Detach and Terminate actions;
 - inherited target list, local cwd, and sshai executable;

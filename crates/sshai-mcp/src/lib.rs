@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 use sshai_core::Target;
 use sshai_ssh::{SftpClient, SshConnector, SshError, SshSession, WorkspaceClient};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader},
     sync::{Mutex, RwLock, mpsc, oneshot},
     task::JoinSet,
     time::Instant,
@@ -40,8 +40,39 @@ pub async fn serve(connector: SshConnector, target: Target, local_root: PathBuf)
     result
 }
 
+/// Serve MCP over an arbitrary bidirectional stream while opening workspace
+/// channels on an already-authenticated SSH transport.
+pub async fn serve_existing_session<S>(
+    session: Arc<SshSession>,
+    local_root: PathBuf,
+    stream: S,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let status = Arc::new(RwLock::new(ConnectionStatus::existing(format!(
+        "{}@{}:{}",
+        session.target().user,
+        session.target().host,
+        session.target().port
+    ))));
+    let (commands, command_rx) = mpsc::channel(128);
+    let handle = RemoteHandle {
+        commands,
+        status: Arc::clone(&status),
+    };
+    let manager = tokio::spawn(existing_session_manager(
+        session, local_root, status, command_rx,
+    ));
+    let (input, output) = tokio::io::split(stream);
+    let result = serve_io(handle.clone(), input, output).await;
+    handle.shutdown().await;
+    let _ = manager.await;
+    result
+}
+
 struct RemoteConnection {
-    session: SshSession,
+    session: Option<SshSession>,
     workspace: WorkspaceClient,
     sftp: SftpClient,
 }
@@ -66,6 +97,8 @@ enum ManagerCommand {
 #[derive(Clone)]
 struct ConnectionStatus {
     target: String,
+    transport: &'static str,
+    reconnects_transport: bool,
     phase: &'static str,
     generation: u64,
     reconnect_attempt: u32,
@@ -82,6 +115,8 @@ impl ConnectionStatus {
     fn new(target: String) -> Self {
         Self {
             target,
+            transport: "dedicated_ssh",
+            reconnects_transport: true,
             phase: "connecting",
             generation: 0,
             reconnect_attempt: 0,
@@ -95,9 +130,19 @@ impl ConnectionStatus {
         }
     }
 
+    fn existing(target: String) -> Self {
+        Self {
+            transport: "existing_session",
+            reconnects_transport: false,
+            ..Self::new(target)
+        }
+    }
+
     fn json(&self) -> Value {
         json!({
             "target": self.target,
+            "transport": self.transport,
+            "reconnects_transport": self.reconnects_transport,
             "phase": self.phase,
             "generation": self.generation,
             "reconnect_attempt": self.reconnect_attempt,
@@ -267,9 +312,12 @@ async fn connection_manager(
                         let delay = reconnect_delay(reconnect_attempt, &mut jitter);
                         next_retry = Instant::now() + delay;
                         mark_retry_wait(&status, reconnect_attempt, delay, &error).await;
-                        eprintln!(
-                            "sshai mcp: reconnect attempt {reconnect_attempt} to {target} failed: {error:#}; retrying in {:.2}s",
-                            delay.as_secs_f64()
+                        tracing::debug!(
+                            %target,
+                            reconnect_attempt,
+                            retry_seconds = delay.as_secs_f64(),
+                            error = %format_args!("{error:#}"),
+                            "MCP SSH reconnect attempt failed"
                         );
                     }
                 }
@@ -287,12 +335,89 @@ async fn connection_manager(
     }
 }
 
+async fn existing_session_manager(
+    session: Arc<SshSession>,
+    local_root: PathBuf,
+    status: Arc<RwLock<ConnectionStatus>>,
+    mut commands: mpsc::Receiver<ManagerCommand>,
+) {
+    let mut connection = match open_existing_connection(&session).await {
+        Ok(connection) => {
+            mark_connected(&status).await;
+            Some(connection)
+        }
+        Err(error) => {
+            mark_disconnected(&status, &error).await;
+            None
+        }
+    };
+
+    while let Some(command) = commands.recv().await {
+        match command {
+            ManagerCommand::Shutdown => break,
+            ManagerCommand::Tool(tool) => {
+                if connection.is_none() {
+                    match open_existing_connection(&session).await {
+                        Ok(opened) => {
+                            mark_connected(&status).await;
+                            connection = Some(opened);
+                        }
+                        Err(error) => {
+                            mark_disconnected(&status, &error).await;
+                            let _ = tool.response.send(Err(anyhow!(
+                                "the existing SSH session is unavailable: {error:#}"
+                            )));
+                            continue;
+                        }
+                    }
+                }
+
+                let result = call_tool_once(
+                    connection.as_mut().expect("connection was opened"),
+                    &local_root,
+                    &tool.name,
+                    &tool.arguments,
+                )
+                .await;
+                if result.as_ref().is_err_and(is_connection_lost) {
+                    if let Some(remote) = connection.take() {
+                        close_connection(remote).await;
+                    }
+                    if let Err(error) = &result {
+                        mark_disconnected(&status, error).await;
+                    }
+                }
+                let _ = tool.response.send(result);
+            }
+        }
+    }
+
+    if let Some(remote) = connection.take() {
+        close_connection(remote).await;
+    }
+}
+
+async fn open_existing_connection(session: &SshSession) -> Result<RemoteConnection> {
+    let mut workspace = session.workspace().await?;
+    match session.sftp().await {
+        Ok(sftp) => Ok(RemoteConnection {
+            session: None,
+            workspace,
+            sftp,
+        }),
+        Err(error) => {
+            let _ = workspace.close().await;
+            Err(error.into())
+        }
+    }
+}
+
 async fn connect_once(connector: &SshConnector, target: &Target) -> Result<RemoteConnection> {
     let session = connector.connect(target).await?;
     let workspace = session.workspace().await?;
     let sftp = session.sftp().await?;
     Ok(RemoteConnection {
-        session,
+        session: Some(session),
         workspace,
         sftp,
     })
@@ -301,7 +426,9 @@ async fn connect_once(connector: &SshConnector, target: &Target) -> Result<Remot
 async fn close_connection(mut connection: RemoteConnection) {
     let _ = connection.workspace.close().await;
     let _ = connection.sftp.close().await;
-    let _ = connection.session.disconnect().await;
+    if let Some(session) = connection.session {
+        let _ = session.disconnect().await;
+    }
 }
 
 async fn update_queue_depth(status: &RwLock<ConnectionStatus>, depth: usize) {
@@ -332,9 +459,10 @@ async fn mark_connected(status: &RwLock<ConnectionStatus>) {
     current.last_heartbeat_unix_ms = Some(now_unix_ms());
     current.next_retry_unix_ms = None;
     current.last_error = None;
-    eprintln!(
-        "sshai mcp: connected to {} (connection generation {})",
-        current.target, current.generation
+    tracing::debug!(
+        target = %current.target,
+        generation = current.generation,
+        "MCP SSH connection established"
     );
 }
 
@@ -405,8 +533,16 @@ fn now_unix_ms() -> u64 {
 }
 
 async fn serve_inner(remote: RemoteHandle) -> Result<()> {
-    let mut input = BufReader::new(tokio::io::stdin());
-    let output = Arc::new(Mutex::new(tokio::io::stdout()));
+    serve_io(remote, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
+async fn serve_io<R, W>(remote: RemoteHandle, input: R, output: W) -> Result<()>
+where
+    R: AsyncRead + Unpin + Send,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let mut input = BufReader::new(input);
+    let output = Arc::new(Mutex::new(output));
     let mut requests = JoinSet::new();
     let mut buffer = Vec::new();
     loop {
@@ -472,11 +608,21 @@ async fn handle_request(remote: &RemoteHandle, message: &Value) -> Result<Value>
                 .get("protocolVersion")
                 .and_then(Value::as_str)
                 .unwrap_or(MCP_FALLBACK_VERSION);
+            let status = remote.status().await;
+            let transport = status
+                .get("transport")
+                .and_then(Value::as_str)
+                .unwrap_or("dedicated_ssh");
+            let transport_instructions = if transport == "existing_session" {
+                "This MCP server opens workspace and SFTP channels on the already-authenticated parent sshai session; it does not perform a second SSH login. If that parent transport closes, start a new sshai shell session."
+            } else {
+                "sshai proactively heartbeats REMOTE and reconnects forever with jittered exponential backoff. Calls arriving during reconnect wait in one ordered queue. Read-only workspace calls interrupted by transport loss are safely replayed; writes, execution, and transfers with uncertain completion are never repeated automatically. workspace_connection_info remains available while REMOTE is offline."
+            };
             Ok(json!({
                 "protocolVersion": protocol,
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": "sshai", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": "This is the REMOTE side of an sshai dual-workspace session. Native file and shell tools operate on LOCAL; workspace_* tools operate on REMOTE. Ordinary workspace paths are relative to the negotiated remote root. Use workspace_transfer for direct non-overwriting LOCAL/REMOTE copies; its remote_path may also be absolute. Only use workspace_transfer_overwrite after the user explicitly requests replacement. A remote cp command cannot read LOCAL files. sshai proactively heartbeats REMOTE and reconnects forever with jittered exponential backoff. Calls arriving during reconnect wait in one ordered queue. Read-only workspace calls interrupted by transport loss are safely replayed; writes, execution, and transfers with uncertain completion are never repeated automatically. workspace_connection_info remains available while REMOTE is offline."
+                "instructions": format!("This is the REMOTE side of an sshai dual-workspace session. Native file and shell tools operate on LOCAL; workspace_* tools operate on REMOTE. Ordinary workspace paths are relative to the negotiated remote root. Use workspace_transfer for direct non-overwriting LOCAL/REMOTE copies; its remote_path may also be absolute. Only use workspace_transfer_overwrite after the user explicitly requests replacement. A remote cp command cannot read LOCAL files. {transport_instructions}")
             }))
         }
         "server/discover" => Ok(json!({
@@ -771,7 +917,10 @@ fn error_response(id: Value, code: i64, message: String) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": message}})
 }
 
-async fn write_message_locked(output: &Mutex<tokio::io::Stdout>, message: &Value) -> Result<()> {
+async fn write_message_locked<W>(output: &Mutex<W>, message: &Value) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
     let mut encoded = serde_json::to_vec(message)?;
     encoded.push(b'\n');
     let mut output = output.lock().await;
@@ -894,5 +1043,46 @@ mod tests {
         assert_eq!(status["phase"], "connecting");
         assert_eq!(status["target"], "host");
         assert_eq!(status["queue_depth"], 0);
+
+        let reused = ConnectionStatus::existing("host".to_owned()).json();
+        assert_eq!(reused["transport"], "existing_session");
+        assert_eq!(reused["reconnects_transport"], false);
+    }
+
+    #[tokio::test]
+    async fn mcp_io_initializes_before_any_remote_tool_call() {
+        let (commands, _command_rx) = mpsc::channel(1);
+        let remote = RemoteHandle {
+            commands,
+            status: Arc::new(RwLock::new(ConnectionStatus::existing("host".to_owned()))),
+        };
+        let (client, server) = tokio::io::duplex(16 * 1024);
+        let (client_read, mut client_write) = tokio::io::split(client);
+        let task = tokio::spawn(async move {
+            let (server_read, server_write) = tokio::io::split(server);
+            serve_io(remote, server_read, server_write).await
+        });
+
+        client_write
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        BufReader::new(client_read)
+            .read_line(&mut response)
+            .await
+            .unwrap();
+        let response: Value = serde_json::from_str(&response).unwrap();
+        assert_eq!(response["id"], 1);
+        assert_eq!(response["result"]["serverInfo"]["name"], "sshai");
+        assert!(
+            response["result"]["instructions"]
+                .as_str()
+                .unwrap()
+                .contains("does not perform a second SSH login")
+        );
+
+        drop(client_write);
+        task.await.unwrap().unwrap();
     }
 }

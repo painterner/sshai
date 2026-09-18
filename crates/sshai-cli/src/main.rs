@@ -1,8 +1,13 @@
 use std::{
     io::{IsTerminal, Read, Write},
+    net::SocketAddr,
     path::{Path, PathBuf},
-    process::ExitCode,
+    process::{ExitCode, Stdio},
     str::FromStr,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use anyhow::{Context, Result};
@@ -12,10 +17,16 @@ use sshai_ai::{AgentSession, AgentUi, OpenAiProvider};
 use sshai_core::Target;
 use sshai_ssh::{
     ConnectOptions, HostKeyPolicy, KeyInstallResult, MAX_WORKSPACE_READ, SessionCommandHandler,
-    SessionCommandResult, SshConnector, WorkspaceClient, WorkspaceMetadata,
+    SessionCommandResult, SessionInputResult, SshConnector, WorkspaceClient, WorkspaceMetadata,
     WorkspaceStreamExecOptions, discover_public_identities,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::{
+    fs,
+    io::{AsyncReadExt, AsyncWriteExt},
+    process::Command as TokioCommand,
+    sync::oneshot,
+    task::JoinHandle,
+};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Debug, Parser)]
@@ -124,7 +135,7 @@ enum Command {
     /// Execute a command remotely and stream stdout/stderr.
     #[command(trailing_var_arg = true)]
     Exec {
-        /// `host`, `user@host:/path`, or `ssh://user@host:port/path`.
+        /// `host`, `user@host:port`, or `ssh://user@host:port/path`.
         target: Target,
 
         /// Command and arguments. Arguments are quoted individually.
@@ -134,7 +145,7 @@ enum Command {
 
     /// Transfer bootstrap files through the pure-Rust SFTP channel.
     Sftp {
-        /// `host`, `user@host`, or `ssh://user@host:port`.
+        /// `host`, `user@host:port`, or `ssh://user@host:port`.
         target: Target,
 
         #[command(subcommand)]
@@ -143,7 +154,7 @@ enum Command {
 
     /// Inspect files rooted in, or execute commands from, the remote workspace.
     Workspace {
-        /// `host`, `user@host:/path`, or `ssh://user@host:port/path`.
+        /// `host`, `user@host:port`, or `ssh://user@host:port/path`.
         target: Target,
 
         #[command(subcommand)]
@@ -152,7 +163,7 @@ enum Command {
 
     /// Serve the remote workspace as a local stdio MCP server.
     Mcp {
-        /// `host`, `user@host:/path`, or `ssh://user@host:port/path`.
+        /// `host`, `user@host:port`, or `ssh://user@host:port/path`.
         target: Target,
 
         /// Local workspace exposed to transfer tools. Defaults to sshai's current directory.
@@ -160,10 +171,18 @@ enum Command {
         local_dir: Option<PathBuf>,
     },
 
+    /// Internal stdio proxy for an already-authenticated interactive session.
+    #[command(hide = true)]
+    SessionMcpProxy {
+        address: SocketAddr,
+        #[arg(long, hide = true)]
+        token: String,
+    },
+
     /// Run sshai's built-in local AI agent against a remote workspace.
     #[command(trailing_var_arg = true)]
     Agent {
-        /// `host`, `user@host:/path`, or `ssh://user@host:port/path`.
+        /// `host`, `user@host:port`, or `ssh://user@host:port/path`.
         target: Target,
 
         /// Responses API model (or set OPENAI_MODEL).
@@ -189,7 +208,7 @@ enum Command {
 
     /// Install local public keys in the remote user's authorized_keys.
     CopyId {
-        /// `host`, `user@host`, or `ssh://user@host:port`.
+        /// `host`, `user@host:port`, or `ssh://user@host:port`.
         target: Target,
 
         /// Public or private identity file. A neighboring `.pub` is preferred.
@@ -387,11 +406,16 @@ async fn run(cli: Cli) -> Result<u8> {
             cli.agent_arguments.clone(),
             launch_config,
             launch_flags,
+            None,
         )
         .await;
     }
 
     let command = cli.command;
+    if let Some(Command::SessionMcpProxy { address, token }) = &command {
+        run_session_mcp_proxy(*address, token).await?;
+        return Ok(0);
+    }
 
     let options = ConnectOptions {
         config_file: cli.config,
@@ -402,7 +426,7 @@ async fn run(cli: Cli) -> Result<u8> {
     let connector = SshConnector::new(options).context("failed to initialize SSH")?;
 
     if let Some(targets) = cli.target {
-        let session = connector.connect(targets.primary()).await?;
+        let session = Arc::new(connector.connect(targets.primary()).await?);
         if cli.no_worker {
             if targets.0.len() > 1 {
                 anyhow::bail!("multiple targets require the session worker; remove --no-worker");
@@ -418,6 +442,7 @@ async fn run(cli: Cli) -> Result<u8> {
             local_root: resolve_local_root(&launch_directory, None)?,
             config: launch_config,
             flags: launch_flags,
+            file_edit: None,
         };
         let exit = if targets.len() > 1 {
             connector
@@ -490,6 +515,7 @@ async fn run(cli: Cli) -> Result<u8> {
             sshai_mcp::serve(connector, target, local_root).await?;
             Ok(0)
         }
+        Command::SessionMcpProxy { .. } => unreachable!("session proxy returned before SSH setup"),
         Command::Agent {
             target,
             model,
@@ -608,17 +634,168 @@ struct LaunchFlags {
     verbose: u8,
 }
 
+#[derive(Clone, Debug)]
+struct SessionMcpEndpoint {
+    address: SocketAddr,
+    token: String,
+}
+
+struct SessionMcpBridge {
+    endpoints: Vec<Option<SessionMcpEndpoint>>,
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl SessionMcpBridge {
+    async fn start(
+        sessions: &[Option<Arc<sshai_ssh::SshSession>>],
+        local_root: &Path,
+    ) -> Result<Self> {
+        let mut endpoints = Vec::with_capacity(sessions.len());
+        let mut tasks = Vec::new();
+        for session in sessions {
+            let Some(session) = session else {
+                endpoints.push(None);
+                continue;
+            };
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .context("cannot bind the local session MCP bridge")?;
+            let address = listener.local_addr()?;
+            let token = random_bridge_token()?;
+            endpoints.push(Some(SessionMcpEndpoint {
+                address,
+                token: token.clone(),
+            }));
+            let session = Arc::clone(session);
+            let local_root = local_root.to_owned();
+            tasks.push(tokio::spawn(async move {
+                loop {
+                    let Ok((mut stream, peer)) = listener.accept().await else {
+                        break;
+                    };
+                    if !peer.ip().is_loopback() {
+                        continue;
+                    }
+                    if !matches!(
+                        tokio::time::timeout(
+                            std::time::Duration::from_secs(5),
+                            authenticate_bridge_stream(&mut stream, &token),
+                        )
+                        .await,
+                        Ok(Ok(()))
+                    ) {
+                        continue;
+                    }
+                    let session = Arc::clone(&session);
+                    let local_root = local_root.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            sshai_mcp::serve_existing_session(session, local_root, stream).await
+                        {
+                            tracing::debug!(%error, "session MCP bridge stopped");
+                        }
+                    });
+                }
+            }));
+        }
+        Ok(Self { endpoints, tasks })
+    }
+}
+
+impl Drop for SessionMcpBridge {
+    fn drop(&mut self) {
+        for task in &self.tasks {
+            task.abort();
+        }
+    }
+}
+
+async fn authenticate_bridge_stream(
+    stream: &mut tokio::net::TcpStream,
+    expected: &str,
+) -> Result<()> {
+    let mut token = Vec::with_capacity(65);
+    let mut byte = [0_u8; 1];
+    while token.len() <= 64 {
+        stream.read_exact(&mut byte).await?;
+        if byte[0] == b'\n' {
+            break;
+        }
+        token.push(byte[0]);
+    }
+    anyhow::ensure!(token.len() == 64, "invalid session MCP bridge token");
+    anyhow::ensure!(
+        token == expected.as_bytes(),
+        "invalid session MCP bridge token"
+    );
+    Ok(())
+}
+
+fn random_bridge_token() -> Result<String> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| anyhow::anyhow!("cannot generate a session MCP bridge token: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
 struct AiSessionCommand {
     targets: Vec<Target>,
     local_root: PathBuf,
     config: Option<PathBuf>,
     flags: LaunchFlags,
+    file_edit: Option<FileEditState>,
+}
+
+static FILE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct FileEditState {
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<Result<String>>>,
+    temporary: PathBuf,
+}
+
+impl Drop for FileEditState {
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+        let _ = std::fs::remove_file(&self.temporary);
+    }
 }
 
 #[async_trait::async_trait]
 impl SessionCommandHandler for AiSessionCommand {
     fn handles(&self, command: &str) -> bool {
-        command == "--agent"
+        matches!(command, "--agent" | "--file")
+    }
+
+    async fn handle_input(&mut self, input: Vec<u8>) -> SessionInputResult {
+        if self.file_edit.is_none() {
+            return SessionInputResult {
+                forward: input,
+                notice: None,
+            };
+        }
+        if !input.contains(&0x11) {
+            return SessionInputResult {
+                forward: Vec::new(),
+                notice: None,
+            };
+        }
+
+        let mut state = self.file_edit.take().expect("file edit state exists");
+        if let Some(stop) = state.stop.take() {
+            let _ = stop.send(());
+        }
+        let notice = match state.task.take().expect("file edit task exists").await {
+            Ok(Ok(message)) => message,
+            Ok(Err(error)) => format!("file edit stopped: {error:#}"),
+            Err(error) => format!("file edit monitor stopped: {error}"),
+        };
+        SessionInputResult {
+            forward: Vec::new(),
+            notice: Some(notice),
+        }
     }
 
     async fn handle(
@@ -627,8 +804,40 @@ impl SessionCommandHandler for AiSessionCommand {
         arguments: &[String],
         session_index: usize,
         remote_cwd: Option<&str>,
+        sessions: Vec<Option<Arc<sshai_ssh::SshSession>>>,
     ) -> SessionCommandResult {
         let targets = targets_at_session_remote_cwd(&self.targets, session_index, remote_cwd);
+        let sessions = sessions_at_session_index(sessions, session_index);
+        if command == "--file" {
+            if self.file_edit.is_some() {
+                return SessionCommandResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: "sshai --file: another remote file is already in edit mode; press Ctrl+Q first\n".to_owned(),
+                };
+            }
+            return match start_remote_file(
+                arguments,
+                remote_cwd,
+                sessions.first().and_then(Option::as_ref),
+            )
+            .await
+            {
+                Ok((message, state)) => {
+                    self.file_edit = Some(state);
+                    SessionCommandResult {
+                        exit_code: 0,
+                        stdout: message,
+                        stderr: String::new(),
+                    }
+                }
+                Err(error) => SessionCommandResult {
+                    exit_code: 1,
+                    stdout: String::new(),
+                    stderr: format!("sshai --file: {error:#}\n"),
+                },
+            };
+        }
         let result = match arguments.split_first() {
             Some((agent, arguments)) => {
                 match session_agent_arguments(&self.local_root, arguments) {
@@ -640,6 +849,7 @@ impl SessionCommandHandler for AiSessionCommand {
                             arguments,
                             self.config.clone(),
                             self.flags,
+                            Some(sessions),
                         )
                         .await
                     }
@@ -663,6 +873,145 @@ impl SessionCommandHandler for AiSessionCommand {
             },
         }
     }
+}
+
+async fn start_remote_file(
+    arguments: &[String],
+    remote_cwd: Option<&str>,
+    session: Option<&Arc<sshai_ssh::SshSession>>,
+) -> Result<(String, FileEditState)> {
+    let [program, remote_file] = arguments else {
+        anyhow::bail!("usage: sshai --file PROGRAM REMOTE_FILE");
+    };
+    let session = session.context("the current SSH session is unavailable")?;
+    let remote_path = resolve_remote_file_path(remote_cwd, remote_file);
+    let temporary = local_file_temp_path(remote_file);
+    let sftp = session.sftp().await?;
+    let result = async {
+        let before = sftp
+            .sha256(remote_path.clone())
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("remote file does not exist: {remote_path}"))?;
+        sftp.download(remote_path.clone(), &temporary, true).await?;
+        let original = fs::read(&temporary).await?;
+
+        let child = TokioCommand::new(program)
+            .arg(&temporary)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("cannot launch local file program {program:?}"))?;
+        Ok((child, before, original))
+    }
+    .await;
+    let (child, before, original) = match result {
+        Ok(value) => value,
+        Err(error) => {
+            let _ = sftp.close().await;
+            let _ = fs::remove_file(&temporary).await;
+            return Err(error);
+        }
+    };
+    let (stop, stop_rx) = oneshot::channel();
+    let monitor_temporary = temporary.clone();
+    let task = tokio::spawn(monitor_file_edit(
+        sftp,
+        monitor_temporary,
+        remote_path.clone(),
+        original,
+        before,
+        stop_rx,
+        child,
+    ));
+    Ok((
+        format!(
+            "file edit mode active for {remote_path}; changes auto-upload, press Ctrl+Q to close\n"
+        ),
+        FileEditState {
+            stop: Some(stop),
+            task: Some(task),
+            temporary,
+        },
+    ))
+}
+
+async fn monitor_file_edit(
+    sftp: sshai_ssh::SftpClient,
+    temporary: PathBuf,
+    remote_path: String,
+    mut last_contents: Vec<u8>,
+    mut remote_digest: String,
+    mut stop: oneshot::Receiver<()>,
+    mut child: tokio::process::Child,
+) -> Result<String> {
+    let mut conflict: Option<String> = None;
+    let result = loop {
+        tokio::select! {
+            _ = &mut stop => {
+                let _ = child.kill().await;
+                break if let Some(error) = conflict {
+                    Err(anyhow::anyhow!(error))
+                } else {
+                    Ok(format!("file edit mode closed; latest changes uploaded for {remote_path}"))
+                };
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                let contents = fs::read(&temporary).await?;
+                if contents == last_contents || conflict.is_some() {
+                    continue;
+                }
+                let current = sftp.sha256(remote_path.clone()).await?;
+                if current.as_deref() != Some(remote_digest.as_str()) {
+                    conflict = Some(format!(
+                        "remote file changed while editing; automatic upload stopped for {remote_path}"
+                    ));
+                    continue;
+                }
+                sftp.upload(&temporary, remote_path.clone(), true).await?;
+                remote_digest = sftp
+                    .sha256(remote_path.clone())
+                    .await?
+                    .unwrap_or(remote_digest);
+                last_contents = contents;
+            }
+        }
+    };
+    let close = sftp.close().await;
+    let _ = fs::remove_file(&temporary).await;
+    match (result, close) {
+        (Ok(message), Ok(())) => Ok(message),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error.into()),
+    }
+}
+
+fn resolve_remote_file_path(remote_cwd: Option<&str>, path: &str) -> String {
+    if path.starts_with('/') {
+        path.to_owned()
+    } else {
+        let base = remote_cwd.unwrap_or(".").trim_end_matches('/');
+        if base.is_empty() {
+            format!("/{path}")
+        } else if base == "." {
+            path.to_owned()
+        } else {
+            format!("{base}/{path}")
+        }
+    }
+}
+
+fn local_file_temp_path(remote_file: &str) -> PathBuf {
+    let name = Path::new(remote_file)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .unwrap_or("remote-file");
+    std::env::temp_dir().join(format!(
+        "sshai-file-{}-{}-{name}",
+        std::process::id(),
+        FILE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 fn is_agent_name(value: &str) -> bool {
@@ -691,6 +1040,17 @@ fn targets_at_session_remote_cwd(
     targets
 }
 
+fn sessions_at_session_index(
+    mut sessions: Vec<Option<Arc<sshai_ssh::SshSession>>>,
+    session_index: usize,
+) -> Vec<Option<Arc<sshai_ssh::SshSession>>> {
+    if session_index < sessions.len() {
+        let selected = sessions.remove(session_index);
+        sessions.insert(0, selected);
+    }
+    sessions
+}
+
 async fn run_selected_agent(
     agent: &str,
     targets: Vec<Target>,
@@ -698,16 +1058,66 @@ async fn run_selected_agent(
     arguments: Vec<String>,
     config: Option<PathBuf>,
     flags: LaunchFlags,
+    sessions: Option<Vec<Option<Arc<sshai_ssh::SshSession>>>>,
 ) -> Result<u8> {
     anyhow::ensure!(
         is_agent_name(agent),
         "invalid agent name {agent:?}; use an executable name, not a path"
     );
-    match agent.to_ascii_lowercase().as_str() {
-        "codex" => run_codex(targets, local_root, arguments, config, flags).await,
-        "claude" => run_claude(targets, local_root, arguments, config, flags).await,
-        _ => run_detected_agent(agent, targets, local_root, arguments, config, flags).await,
+    let (targets, sessions) = match sessions {
+        Some(sessions) => {
+            let requested = targets.len();
+            let mut connected_targets = Vec::new();
+            let mut connected_sessions = Vec::new();
+            for (index, target) in targets.into_iter().enumerate() {
+                if let Some(Some(session)) = sessions.get(index) {
+                    connected_targets.push(target);
+                    connected_sessions.push(Some(Arc::clone(session)));
+                }
+            }
+            anyhow::ensure!(
+                !connected_targets.is_empty(),
+                "the parent sshai session has no connected remote available to the agent"
+            );
+            let skipped = requested.saturating_sub(connected_targets.len());
+            if skipped > 0 {
+                eprintln!(
+                    "sshai: {skipped} background target{} not yet connected; omitting {} from this agent session to avoid a second SSH login",
+                    if skipped == 1 { " is" } else { "s are" },
+                    if skipped == 1 { "it" } else { "them" },
+                );
+            }
+            (connected_targets, Some(connected_sessions))
+        }
+        None => (targets, None),
+    };
+    let bridge = match sessions {
+        Some(sessions) => Some(SessionMcpBridge::start(&sessions, &local_root).await?),
+        None => None,
+    };
+    let endpoints = bridge.as_ref().map(|bridge| bridge.endpoints.as_slice());
+    if let Some(endpoints) = endpoints {
+        let reused = endpoints
+            .iter()
+            .filter(|endpoint| endpoint.is_some())
+            .count();
+        eprintln!(
+            "sshai: reusing {reused} authenticated SSH session{} for agent MCP",
+            if reused == 1 { "" } else { "s" }
+        );
     }
+    let result = match agent.to_ascii_lowercase().as_str() {
+        "codex" => run_codex(targets, local_root, arguments, config, flags, endpoints).await,
+        "claude" => run_claude(targets, local_root, arguments, config, flags, endpoints).await,
+        _ => {
+            run_detected_agent(
+                agent, targets, local_root, arguments, config, flags, endpoints,
+            )
+            .await
+        }
+    };
+    drop(bridge);
+    result
 }
 
 async fn run_codex(
@@ -716,6 +1126,7 @@ async fn run_codex(
     arguments: Vec<String>,
     config: Option<PathBuf>,
     flags: LaunchFlags,
+    endpoints: Option<&[Option<SessionMcpEndpoint>]>,
 ) -> Result<u8> {
     anyhow::ensure!(
         !targets.is_empty(),
@@ -738,10 +1149,15 @@ async fn run_codex(
         .arg("workspace-write")
         .arg("-c")
         .arg(instructions_override);
-    for server in &servers {
+    for (index, server) in servers.iter().enumerate() {
         let prefix = format!("mcp_servers.{}", server.name);
-        let mcp_arguments =
-            sshai_mcp_arguments(&server.target, &local_root, config.as_deref(), flags);
+        let mcp_arguments = sshai_mcp_arguments(
+            &server.target,
+            &local_root,
+            config.as_deref(),
+            flags,
+            session_endpoint(endpoints, index),
+        );
         command
             .arg("-c")
             .arg(format!(
@@ -785,6 +1201,7 @@ async fn run_claude(
     arguments: Vec<String>,
     config: Option<PathBuf>,
     flags: LaunchFlags,
+    endpoints: Option<&[Option<SessionMcpEndpoint>]>,
 ) -> Result<u8> {
     anyhow::ensure!(
         !targets.is_empty(),
@@ -800,6 +1217,7 @@ async fn run_claude(
         config.as_deref(),
         flags,
         true,
+        endpoints,
     );
     let mcp_config = serde_json::json!({"mcpServers": mcp_servers});
 
@@ -849,6 +1267,7 @@ async fn run_detected_agent(
     arguments: Vec<String>,
     config: Option<PathBuf>,
     flags: LaunchFlags,
+    endpoints: Option<&[Option<SessionMcpEndpoint>]>,
 ) -> Result<u8> {
     anyhow::ensure!(
         !targets.is_empty(),
@@ -862,9 +1281,11 @@ async fn run_detected_agent(
     }
     let adapter = detect_agent_adapter(agent, &help)?;
     match adapter {
-        DetectedAgent::Gemini => run_gemini(targets, local_root, arguments, config, flags).await,
+        DetectedAgent::Gemini => {
+            run_gemini(targets, local_root, arguments, config, flags, endpoints).await
+        }
         DetectedAgent::OpenCode => {
-            run_opencode(targets, local_root, arguments, config, flags).await
+            run_opencode(targets, local_root, arguments, config, flags, endpoints).await
         }
         DetectedAgent::GenericMcp {
             mcp_config_flag,
@@ -879,6 +1300,7 @@ async fn run_detected_agent(
                 flags,
                 mcp_config_flag,
                 prompt_flag,
+                endpoints,
             )
             .await
         }
@@ -938,6 +1360,7 @@ async fn run_gemini(
     arguments: Vec<String>,
     config: Option<PathBuf>,
     flags: LaunchFlags,
+    endpoints: Option<&[Option<SessionMcpEndpoint>]>,
 ) -> Result<u8> {
     let executable = std::env::current_exe().context("cannot locate the sshai executable")?;
     let servers = remote_servers(&targets);
@@ -961,6 +1384,7 @@ async fn run_gemini(
             config.as_deref(),
             flags,
             false,
+            endpoints,
         ),
     );
     std::fs::write(&settings_path, serde_json::to_vec_pretty(&settings)?)?;
@@ -990,6 +1414,7 @@ async fn run_opencode(
     arguments: Vec<String>,
     config: Option<PathBuf>,
     flags: LaunchFlags,
+    endpoints: Option<&[Option<SessionMcpEndpoint>]>,
 ) -> Result<u8> {
     let executable = std::env::current_exe().context("cannot locate the sshai executable")?;
     let servers = remote_servers(&targets);
@@ -1003,13 +1428,14 @@ async fn run_opencode(
 
     let mut settings = load_json_object_from_env("OPENCODE_CONFIG_CONTENT")?;
     let mut mcp = Map::new();
-    for server in &servers {
+    for (index, server) in servers.iter().enumerate() {
         let mut command = vec![executable.to_string_lossy().into_owned()];
         command.extend(sshai_mcp_arguments(
             &server.target,
             &local_root,
             config.as_deref(),
             flags,
+            session_endpoint(endpoints, index),
         ));
         mcp.insert(
             server.name.clone(),
@@ -1063,6 +1489,7 @@ async fn run_generic_mcp_agent(
     flags: LaunchFlags,
     mcp_config_flag: bool,
     prompt_flag: AgentPromptFlag,
+    endpoints: Option<&[Option<SessionMcpEndpoint>]>,
 ) -> Result<u8> {
     let executable = std::env::current_exe().context("cannot locate the sshai executable")?;
     let servers = remote_servers(&targets);
@@ -1081,6 +1508,7 @@ async fn run_generic_mcp_agent(
             config.as_deref(),
             flags,
             true,
+            endpoints,
         )
     });
     std::fs::write(&config_path, serde_json::to_vec_pretty(&mcp_config)?)?;
@@ -1138,13 +1566,21 @@ fn stdio_mcp_servers(
     config: Option<&Path>,
     flags: LaunchFlags,
     include_type: bool,
+    endpoints: Option<&[Option<SessionMcpEndpoint>]>,
 ) -> Map<String, Value> {
     servers
         .iter()
-        .map(|server| {
+        .enumerate()
+        .map(|(index, server)| {
             let mut value = serde_json::json!({
                 "command": executable.to_string_lossy(),
-                "args": sshai_mcp_arguments(&server.target, local_root, config, flags),
+                "args": sshai_mcp_arguments(
+                    &server.target,
+                    local_root,
+                    config,
+                    flags,
+                    session_endpoint(endpoints, index),
+                ),
             });
             if include_type {
                 value
@@ -1363,12 +1799,49 @@ fn process_exit_code(status: std::process::ExitStatus) -> u8 {
         .unwrap_or(128)
 }
 
+async fn run_session_mcp_proxy(address: SocketAddr, token: &str) -> Result<()> {
+    anyhow::ensure!(
+        address.ip().is_loopback(),
+        "session MCP bridge must be loopback-only"
+    );
+    anyhow::ensure!(token.len() == 64, "invalid session MCP bridge token");
+    let mut stream = tokio::net::TcpStream::connect(address)
+        .await
+        .with_context(|| format!("cannot connect to the parent sshai session at {address}"))?;
+    stream.write_all(token.as_bytes()).await?;
+    stream.write_all(b"\n").await?;
+    stream.flush().await?;
+
+    let (mut bridge_read, mut bridge_write) = stream.into_split();
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+    let upload = async {
+        tokio::io::copy(&mut stdin, &mut bridge_write).await?;
+        bridge_write.shutdown().await
+    };
+    let download = async {
+        tokio::io::copy(&mut bridge_read, &mut stdout).await?;
+        stdout.flush().await
+    };
+    tokio::try_join!(upload, download)?;
+    Ok(())
+}
+
 fn sshai_mcp_arguments(
     target: &Target,
     local_root: &Path,
     config: Option<&std::path::Path>,
     flags: LaunchFlags,
+    endpoint: Option<&SessionMcpEndpoint>,
 ) -> Vec<String> {
+    if let Some(endpoint) = endpoint {
+        return vec![
+            "session-mcp-proxy".to_owned(),
+            endpoint.address.to_string(),
+            "--token".to_owned(),
+            endpoint.token.clone(),
+        ];
+    }
     let mut arguments = Vec::new();
     if let Some(config) = config {
         arguments.push("-F".to_owned());
@@ -1394,6 +1867,13 @@ fn sshai_mcp_arguments(
     arguments.push("--local-dir".to_owned());
     arguments.push(local_root.to_string_lossy().into_owned());
     arguments
+}
+
+fn session_endpoint(
+    endpoints: Option<&[Option<SessionMcpEndpoint>]>,
+    index: usize,
+) -> Option<&SessionMcpEndpoint> {
+    endpoints?.get(index)?.as_ref()
 }
 
 async fn run_builtin_agent(
@@ -1611,9 +2091,13 @@ mod tests {
 
     #[test]
     fn parses_a_bare_target_as_the_interactive_shell() {
-        let cli = Cli::try_parse_from(["sshai", "ka@ka2", "-v", "--no-agent"]).unwrap();
+        let cli = Cli::try_parse_from(["sshai", "ka@ka2:2222", "-v", "--no-agent"]).unwrap();
 
-        assert_eq!(cli.target.unwrap().to_string(), "ka@ka2");
+        let target = cli.target.unwrap().primary().clone();
+        assert_eq!(target.host, "ka2");
+        assert_eq!(target.user.as_deref(), Some("ka"));
+        assert_eq!(target.port, Some(2222));
+        assert_eq!(target.to_string(), "ka@ka2:2222");
         assert!(cli.command.is_none());
         assert_eq!(cli.verbose, 1);
         assert!(cli.no_worker);
@@ -1646,25 +2130,25 @@ mod tests {
     #[test]
     fn session_codex_uses_the_remote_working_directory() {
         let targets = vec![
-            "ka@ka2:/initial".parse().unwrap(),
-            "build:/opt/build".parse().unwrap(),
+            "ssh://ka@ka2/initial".parse().unwrap(),
+            "ssh://build/opt/build".parse().unwrap(),
         ];
         let targets = targets_at_session_remote_cwd(&targets, 0, Some("/srv/project"));
 
-        assert_eq!(targets[0].to_string(), "ka@ka2:/srv/project");
-        assert_eq!(targets[1].to_string(), "build:/opt/build");
+        assert_eq!(targets[0].to_string(), "ssh://ka@ka2/srv/project");
+        assert_eq!(targets[1].to_string(), "ssh://build/opt/build");
     }
 
     #[test]
     fn session_agent_promotes_the_selected_remote() {
         let targets = vec![
-            "ka@ka2:/initial".parse().unwrap(),
-            "build:/opt/build".parse().unwrap(),
+            "ssh://ka@ka2/initial".parse().unwrap(),
+            "ssh://build/opt/build".parse().unwrap(),
         ];
         let targets = targets_at_session_remote_cwd(&targets, 1, Some("/srv/current"));
 
-        assert_eq!(targets[0].to_string(), "build:/srv/current");
-        assert_eq!(targets[1].to_string(), "ka@ka2:/initial");
+        assert_eq!(targets[0].to_string(), "ssh://build/srv/current");
+        assert_eq!(targets[1].to_string(), "ssh://ka@ka2/initial");
     }
 
     #[test]
@@ -1687,8 +2171,10 @@ mod tests {
                 batch: false,
                 verbose: 0,
             },
+            file_edit: None,
         };
         assert!(handler.handles("--agent"));
+        assert!(handler.handles("--file"));
         assert!(!handler.handles("codex"));
         assert!(!handler.handles("claude"));
         assert!(!handler.handles("info"));
@@ -1702,14 +2188,14 @@ mod tests {
             "codex",
             "--local-dir",
             ".",
-            "ka@ka2:/srv/project",
+            "ssh://ka@ka2/srv/project",
             "--",
             "--version",
         ])
         .unwrap();
         assert_eq!(cli.agent.as_deref(), Some("codex"));
         assert_eq!(cli.local_dir.as_deref(), Some(Path::new(".")));
-        assert_eq!(cli.target.unwrap().to_string(), "ka@ka2:/srv/project");
+        assert_eq!(cli.target.unwrap().to_string(), "ssh://ka@ka2/srv/project");
         assert_eq!(cli.agent_arguments, ["--version"]);
     }
 
@@ -1736,23 +2222,23 @@ mod tests {
 
     #[test]
     fn dual_workspace_prompt_assigns_native_tools_to_local() {
-        let target: Target = "ka@ka2:/srv/project".parse().unwrap();
+        let target: Target = "ssh://ka@ka2/srv/project".parse().unwrap();
         let servers = remote_servers(&[target]);
         let instructions = dual_workspace_instructions(Path::new("/local/project"), &servers);
 
         assert!(instructions.contains("ordinary shell/file tools mean LOCAL"));
         assert!(instructions.contains("workspace_transfer"));
         assert!(instructions.contains("never use remote `cp`"));
-        assert!(instructions.contains("ka@ka2:/srv/project"));
+        assert!(instructions.contains("ssh://ka@ka2/srv/project"));
     }
 
     #[test]
     fn parses_multiple_interactive_and_agent_targets() {
-        let cli = Cli::try_parse_from(["sshai", "host1,dev@host2:/srv/app"]).unwrap();
+        let cli = Cli::try_parse_from(["sshai", "host1,ssh://dev@host2/srv/app"]).unwrap();
         let targets = cli.target.unwrap().into_vec();
         assert_eq!(targets.len(), 2);
         assert_eq!(targets[0].host, "host1");
-        assert_eq!(targets[1].to_string(), "dev@host2:/srv/app");
+        assert_eq!(targets[1].to_string(), "ssh://dev@host2/srv/app");
 
         let cli = Cli::try_parse_from(["sshai", "--agent", "codex", "host1,host2"]).unwrap();
         assert_eq!(cli.agent.as_deref(), Some("codex"));
@@ -1778,7 +2264,7 @@ mod tests {
     fn remote_server_names_are_stable_and_unique() {
         let targets = [
             "root@Build.Example".parse().unwrap(),
-            "dev@build.example:/srv".parse().unwrap(),
+            "ssh://dev@build.example/srv".parse().unwrap(),
             "10.0.0.2".parse().unwrap(),
         ];
         let servers = remote_servers(&targets);
@@ -1884,5 +2370,54 @@ mod tests {
         assert_eq!(settings["theme"], "dark");
         assert!(settings["mcpServers"]["existing"].is_object());
         assert!(settings["mcpServers"]["sshai_host"].is_object());
+    }
+
+    #[test]
+    fn session_mcp_arguments_reuse_the_parent_transport() {
+        let target: Target = "root@example.com:2222".parse().unwrap();
+        let endpoint = SessionMcpEndpoint {
+            address: "127.0.0.1:43123".parse().unwrap(),
+            token: "ab".repeat(32),
+        };
+        let arguments = sshai_mcp_arguments(
+            &target,
+            Path::new("/local"),
+            None,
+            LaunchFlags {
+                strict_host_key: false,
+                accept_new: false,
+                insecure: false,
+                batch: false,
+                verbose: 0,
+            },
+            Some(&endpoint),
+        );
+
+        assert_eq!(arguments[0], "session-mcp-proxy");
+        assert_eq!(arguments[1], "127.0.0.1:43123");
+        assert!(!arguments.iter().any(|argument| argument == "mcp"));
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.contains("example.com"))
+        );
+    }
+
+    #[test]
+    fn parses_internal_session_mcp_proxy() {
+        let token = "cd".repeat(32);
+        let cli = Cli::try_parse_from([
+            "sshai",
+            "session-mcp-proxy",
+            "127.0.0.1:43123",
+            "--token",
+            &token,
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::SessionMcpProxy { address, token: parsed })
+                if address == "127.0.0.1:43123".parse().unwrap() && parsed == token
+        ));
     }
 }

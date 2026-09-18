@@ -80,6 +80,9 @@ let context: Context;
 const sessions = new Map<string, SessionInfo>();
 const views = new Map<string, PaneView>();
 const app = document.querySelector<HTMLDivElement>("#app")!;
+const appWindow = getCurrentWindow();
+
+type ResizeDirection = "North" | "NorthEast" | "East" | "SouthEast" | "South" | "SouthWest" | "West" | "NorthWest";
 
 class PaneView {
   readonly terminal: Terminal;
@@ -270,6 +273,7 @@ function render() {
   if (active) stage.append(renderNode(active.root));
   shell.append(stage);
   shell.append(statusbar());
+  shell.append(resizeHandles());
   app.append(shell);
   requestAnimationFrame(() => {
     const focused = state.focusedPaneId ? views.get(state.focusedPaneId) : undefined;
@@ -280,8 +284,11 @@ function render() {
 
 function toolbar() {
   const bar = element("header", "toolbar");
+  bar.setAttribute("data-tauri-drag-region", "");
   const brand = element("div", "brand");
   brand.innerHTML = `<span class="brand-mark">&gt;_</span><span>termm</span>`;
+  brand.setAttribute("data-tauri-drag-region", "");
+  brand.querySelectorAll("span").forEach((item) => item.setAttribute("data-tauri-drag-region", ""));
   bar.append(brand);
   bar.append(button("＋ New", () => void newTab()));
   bar.append(button("Split ↔", () => void splitFocused("row")));
@@ -289,6 +296,7 @@ function toolbar() {
   bar.append(button("Detach", detachFocused, "quiet"));
   bar.append(button("Terminate", () => void terminateFocused(), "danger"));
   const spacer = element("div", "spacer");
+  spacer.setAttribute("data-tauri-drag-region", "");
   bar.append(spacer);
   const target = document.createElement("input");
   target.className = "context-input target-input";
@@ -309,7 +317,56 @@ function toolbar() {
   };
   cwd.title = "Local cwd inherited by New and Split";
   bar.append(cwd);
+  bar.append(windowControls());
   return bar;
+}
+
+function windowControls() {
+  const controls = element("div", "window-controls");
+  controls.append(
+    windowControl("−", "Minimize", () => appWindow.minimize()),
+    windowControl("□", "Maximize or restore", () => appWindow.toggleMaximize()),
+    windowControl("×", "Close", () => appWindow.close(), "close"),
+  );
+  return controls;
+}
+
+function windowControl(label: string, title: string, action: () => Promise<void>, className = "") {
+  const control = document.createElement("button");
+  control.className = `window-control ${className}`.trim();
+  control.type = "button";
+  control.title = title;
+  control.setAttribute("aria-label", title);
+  control.textContent = label;
+  control.onclick = (event) => {
+    event.stopPropagation();
+    void action();
+  };
+  return control;
+}
+
+function resizeHandles() {
+  const handles = element("div", "resize-handles");
+  const directions: Array<[string, ResizeDirection]> = [
+    ["n", "North"],
+    ["ne", "NorthEast"],
+    ["e", "East"],
+    ["se", "SouthEast"],
+    ["s", "South"],
+    ["sw", "SouthWest"],
+    ["w", "West"],
+    ["nw", "NorthWest"],
+  ];
+  for (const [className, direction] of directions) {
+    const handle = element("div", `resize-handle ${className}`);
+    handle.onmousedown = (event) => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      void appWindow.startResizeDragging(direction);
+    };
+    handles.append(handle);
+  }
+  return handles;
 }
 
 function tabbar() {
@@ -538,8 +595,7 @@ bootstrap()
     app.innerHTML = `<div class="fatal"><h1>termm failed to start</h1><pre>${escapeHtml(String(error))}</pre></div>`;
   })
   .finally(async () => {
-    const window = getCurrentWindow();
-    await window.show();
-    await window.setFocus();
+    await appWindow.show();
+    await appWindow.setFocus();
   })
   .catch((error) => console.error("termm could not reveal its window", error));

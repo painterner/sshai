@@ -24,6 +24,7 @@ use nix::{
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, State};
+use tauri_plugin_window_state::StateFlags;
 use tokio::{
     io::unix::AsyncFd,
     process::Command,
@@ -213,6 +214,12 @@ fn run_app() -> Result<()> {
     };
     tauri::Builder::default()
         .manage(state)
+        .plugin(
+            tauri_plugin_window_state::Builder::default()
+                .with_state_flags(StateFlags::SIZE | StateFlags::POSITION | StateFlags::MAXIMIZED)
+                .with_filename(".window-state-v2.json")
+                .build(),
+        )
         .invoke_handler(tauri::generate_handler![
             get_context,
             list_sessions,

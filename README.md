@@ -35,14 +35,13 @@ target/release/sshai
 target/release/sshai-worker
 ```
 
-安装到 Cargo 的用户级命令目录后，就可以在其他路径直接运行：
+推荐使用安装脚本；Linux 上它会额外构建完全静态的 `sshai-worker-static`，避免本机与较旧远端之间的 glibc 版本不兼容：
 
 ```bash
-cargo install --locked --path crates/sshai-cli --force
-cargo install --locked --path termm --force
+./scripts/install.sh --with-termm
 ```
 
-第一条命令会同时安装 `sshai` 和 `sshai-worker`，第二条安装 `termm`。确保 `~/.cargo/bin` 已加入 `PATH`；随后用 `sshai --version` 验证。
+只安装 CLI/worker 时省略 `--with-termm`。普通 `cargo install --locked --path crates/sshai-cli --force` 仍可使用，但其动态 worker 只兼容 glibc 不旧于构建机的 Linux；运行时会优先选择同目录下的静态 worker。确保 `~/.cargo/bin` 已加入 `PATH`；随后用 `sshai --version` 验证。
 
 `termm` 是独立子工程和二进制，提供 sshai 原生的标签页、点击新建、横纵分屏和 broker-owned PTY：
 
@@ -59,12 +58,23 @@ termm build-server,test-server --cwd ~/projects/app
 
 ```bash
 sshai dev-server
-sshai user@example.com:/srv/project
+sshai user@example.com:2222
 sshai ssh://user@example.com:2222/srv/project
 sshai build-server,test-server,prod-server
 ```
 
-多主机形式会先连接并立即打开第一台主机的 Shell，不等待其他主机。其余主机在后台并行完成连接、PTY 和 worker 启动；连接成功后可用 `Ctrl+Shift+←` / `Ctrl+Shift+→` 在仍然存活的主机之间循环切换。每台主机保留独立的 Shell、当前目录和前台程序，后台输出不会混入当前屏幕；切回时会用每台主机最近最多 4 MiB 的终端输出重建画面。
+裸目标格式为 `host`、`user@host`、`host:port` 或 `user@host:port`。冒号后的内容只表示 SSH 端口，不再兼容 SCP 的 `host:/path` 写法；若确实需要指定初始远端工作区，使用 `ssh://user@host:port/path`。
+
+多主机形式会先连接并立即打开第一台主机的 Shell，不等待其他主机。首次进入只追加一行快捷键提示，不清除当前终端或已有滚动历史；第一次切换后才由虚拟屏幕接管可见区。其余主机在后台并行完成连接、PTY 和 worker 启动；连接成功后可用单次按键 `Shift+←` / `Shift+→` 在仍然存活的主机之间循环切换。原来的 `Ctrl+Shift+←` / `Ctrl+Shift+→` 检测仍然保留，但 Terminator 默认占用它们调整分屏大小。备用方式是先按 `Ctrl+]`，再按 `←` / `→`（或 `h` / `l`）；连续按两次 `Ctrl+]` 会向远端发送一个原始 `Ctrl+]`。传统终端无法可靠区分 `Ctrl+Shift+[/]` 与普通 `Esc` / `Ctrl+]`，也无法区分 `Ctrl+Shift+J/L` 与换行/清屏控制字符，因此这些组合没有被占用。每台主机保留独立的 Shell、当前目录、前台程序和 VT100 屏幕状态；切换时只恢复该主机当前可见画面，不会清除共享滚动历史、重放历史输出或持续增加滚动行。活动主机正常执行 `exit` 会关闭所有主机并一次返回本地；无退出状态的意外断线仍会保留其他存活主机。
+
+进入会话时会列出 local 与所有目标的工作目录、操作系统、CPU 架构和内存；尚未完成后台连接的目标显示为 `connecting`。多主机会话内随时执行 `sshai hosts`（`sshai info` 同义）可查看最新状态，包括已经连接、失败或关闭的目标：
+
+```text
+sshai connections
+  1. local: /home/ka (Ubuntu 24.04 LTS, x86_64, 4 GiB)
+  2. build: /root/test (Ubuntu 22.04 LTS, x86_64, 2 GiB)
+  3. test: connecting
+```
 
 后台连接不会读取密码、私钥口令、keyboard-interactive 或未知主机确认，以免抢占已经交给第一台主机的键盘。应预先使用 SSH Agent、公钥和 `known_hosts`；某台后台主机失败不会影响其他主机，按切换键且没有其他可用主机时会显示连接中及失败状态。
 
@@ -92,7 +102,9 @@ sshai copy-id
 sshai copy-id -i '~/.ssh/id_ed25519.pub'
 ```
 
-会话内执行 `sshai --agent codex` 或 `sshai --agent claude` 会把终端临时交给对应的本机 AI CLI。本机启动 `sshai` 时的目录是可读写的 local 工作区，远端 Shell 的当前目录是 primary remote 工作区；AI CLI 退出后回到原远端 Shell。可用 `sshai --agent codex --local-dir '/本机/其他目录'` 覆盖 local 目录；请引用路径，避免先被远端 Shell 展开。
+执行 `sshai --file PROGRAM REMOTE_FILE` 会在当前本地机器上打开远程文件并进入文件编辑模式。文件通过当前已认证的 SSH/SFTP 通道下载到临时文件，编辑期间每 500 ms 检测并自动回传修改；按 `Ctrl+Q` 退出编辑模式。若远端文件在编辑期间被其他进程修改，sshai 会停止自动回传并拒绝覆盖。该模式适合 GUI 查看/编辑程序（例如 `code`）；终端型编辑器需要自身独占终端，不建议与远端 Shell 同时使用。
+
+会话内执行 `sshai --agent codex` 或 `sshai --agent claude` 会把终端临时交给对应的本机 AI CLI。本机启动 `sshai` 时的目录是可读写的 local 工作区，远端 Shell 的当前目录是 primary remote 工作区；AI CLI 退出后回到原远端 Shell。Agent 的 MCP workspace 通过带随机令牌的本机 loopback bridge 复用当前已经认证的 SSH transport，并在其上新开 worker/SFTP channel，不会再次登录远端。可用 `sshai --agent codex --local-dir '/本机/其他目录'` 覆盖 local 目录；请引用路径，避免先被远端 Shell 展开。
 
 逗号分隔的目标会建立一个本机 + 多远端 AI 会话。交互 Shell 从第一个目标立即开始，其他目标连接完成后可切换；任意主机内的 `sshai --agent NAME` 都会把当前主机作为 primary remote，并将所有目标分别注入为具名 MCP 工作区：
 
@@ -122,15 +134,15 @@ sshai --no-worker dev-server
 通过 Workspace RPC 检查远端工作区：
 
 ```bash
-sshai workspace dev-server:/srv/project open
-sshai workspace dev-server:/srv/project list . --limit 200
-sshai workspace dev-server:/srv/project stat Cargo.toml
-sshai workspace dev-server:/srv/project read README.md
-sshai workspace dev-server:/srv/project hash Cargo.lock
-sshai workspace dev-server:/srv/project exec -- cargo test
-sshai workspace dev-server:/srv/project exec --cwd crates/core --env RUST_LOG=debug -- cargo test
-sshai workspace dev-server:/srv/project exec --pty -- ls --color=auto -C
-sshai workspace dev-server:/srv/project exec --pty --shell -- 'ls'
+sshai workspace ssh://dev-server/srv/project open
+sshai workspace ssh://dev-server/srv/project list . --limit 200
+sshai workspace ssh://dev-server/srv/project stat Cargo.toml
+sshai workspace ssh://dev-server/srv/project read README.md
+sshai workspace ssh://dev-server/srv/project hash Cargo.lock
+sshai workspace ssh://dev-server/srv/project exec -- cargo test
+sshai workspace ssh://dev-server/srv/project exec --cwd crates/core --env RUST_LOG=debug -- cargo test
+sshai workspace ssh://dev-server/srv/project exec --pty -- ls --color=auto -C
+sshai workspace ssh://dev-server/srv/project exec --pty --shell -- 'ls'
 ```
 
 `list/stat/read/hash` 只能访问工作区根目录内的相对路径；绝对路径、`..` 和指向根目录外的符号链接都会被拒绝。`list` 使用稳定的名称游标分页，`read` 每次最多读取 512 KiB。
@@ -142,10 +154,10 @@ Workspace `exec` 默认直接使用 argv 启动进程，不经过 Shell，以独
 直接启动本机已经登录的 Codex CLI：
 
 ```bash
-sshai --agent codex dev-server:/srv/project
-sshai --agent codex dev-server:/srv/project -- "修复测试并在远端运行 cargo test"
-sshai --agent codex dev-server:/srv/project -- exec "检查这个项目的错误处理"
-sshai --agent codex --local-dir ~/projects/app build-server:/src,test-server:/srv/app
+sshai --agent codex ssh://dev-server/srv/project
+sshai --agent codex ssh://dev-server/srv/project -- "修复测试并在远端运行 cargo test"
+sshai --agent codex ssh://dev-server/srv/project -- exec "检查这个项目的错误处理"
+sshai --agent codex --local-dir ~/projects/app ssh://build-server/src,ssh://test-server/srv/app
 ```
 
 `sshai --agent codex` 不复制或修改 Codex 登录凭据，也不持久修改 `~/.codex/config.toml`。Codex 在 local 工作区以 `workspace-write` sandbox 运行；普通文件、编辑和 Shell 工具操作 local，按主机命名的 `sshai_*` MCP 工具操作对应 remote。启动时会显示每个工作区的位置，避免同名路径混淆。
@@ -153,8 +165,8 @@ sshai --agent codex --local-dir ~/projects/app build-server:/src,test-server:/sr
 本机已经登录 Claude Code 时，也可以使用相同的远程工具：
 
 ```bash
-sshai --agent claude dev-server:/srv/project
-sshai --agent claude dev-server:/srv/project -- "检查并修复测试"
+sshai --agent claude ssh://dev-server/srv/project
+sshai --agent claude ssh://dev-server/srv/project -- "检查并修复测试"
 sshai --agent claude --local-dir ~/projects/app build-server,test-server
 ```
 
@@ -174,7 +186,7 @@ sshai --agent claude --local-dir ~/projects/app build-server,test-server
 也可以把 MCP Server 接入其他兼容客户端：
 
 ```bash
-sshai mcp dev-server:/srv/project --local-dir ~/projects/app
+sshai mcp ssh://dev-server/srv/project --local-dir ~/projects/app
 ```
 
 MCP 提供 `workspace_info/list/stat/read/hash/write/edit/mkdir/rename/remove/exec/transfer`。`workspace_info` 同时报告远端 OS、CPU 架构和 Shell。`workspace_transfer` 在 local 与该 remote 之间通过 SFTP 直接传输文件或目录，不把文件内容送进模型上下文；local 路径必须位于本机工作区根内，remote 路径既可相对远端工作区，也可显式指定 `/tmp/example` 之类的绝对路径。符号链接和特殊文件会被拒绝，目录复制需要 `recursive=true`。
@@ -197,13 +209,13 @@ MCP Server 每 15 秒在空闲连接上进行一次 workspace 心跳，SSH、wor
 export OPENAI_API_KEY=...
 
 # 交互会话
-sshai agent dev-server:/srv/project
+sshai agent ssh://dev-server/srv/project
 
 # 单次任务
-sshai agent dev-server:/srv/project -- "修复失败的测试并验证"
+sshai agent ssh://dev-server/srv/project -- "修复失败的测试并验证"
 
 # 自动批准远端命令和修改，适合受控的开发机
-sshai agent dev-server:/srv/project --approval auto -- "运行测试并修复问题"
+sshai agent ssh://dev-server/srv/project --approval auto -- "运行测试并修复问题"
 ```
 
 内置 Agent 在本地调用 Responses API，模型凭证不会进入 SSH 通道或远端主机。默认模型是 `gpt-5.4-mini`；可以使用 `--model` 或 `OPENAI_MODEL` 修改。默认 API 地址是 `https://api.openai.com/v1`；兼容服务可以通过 `--api-base` 或 `OPENAI_BASE_URL` 指定，非本机地址必须使用 HTTPS。
@@ -219,8 +231,8 @@ sshai agent dev-server:/srv/project --approval auto -- "运行测试并修复问
 在远程工作区执行命令：
 
 ```bash
-sshai exec dev-server:/srv/project -- cargo test
-sshai exec dev-server:/srv/project -- printf '%s\n' 'hello world'
+sshai exec ssh://dev-server/srv/project -- cargo test
+sshai exec ssh://dev-server/srv/project -- printf '%s\n' 'hello world'
 ```
 
 检查解析后的配置并建立连接：

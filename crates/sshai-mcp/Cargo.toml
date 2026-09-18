@@ -12,3 +12,4 @@ sshai-core = { path = "../sshai-core" }
 sshai-ssh = { path = "../sshai-ssh" }
 sshai-tools = { path = "../sshai-tools" }
 tokio.workspace = true
+tracing.workspace = true

@@ -22,6 +22,7 @@ sshai-protocol = { path = "../sshai-protocol" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+vt100.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

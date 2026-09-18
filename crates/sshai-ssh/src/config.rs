@@ -503,7 +503,7 @@ mod tests {
         )
         .unwrap();
         let config = SshConfig::load(file.path()).unwrap();
-        let target: Target = "prod:/srv/app".parse().unwrap();
+        let target: Target = "prod".parse().unwrap();
         let resolved = config.resolve(&target).unwrap();
         assert_eq!(resolved.host, "server.example.com");
         assert_eq!(resolved.user, "deploy");

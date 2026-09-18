@@ -21,6 +21,7 @@ sshai can provide the same persistence without exposing tmux to the user. The UI
 - Closing the application detaches by default. Explicit **Terminate** ends the remote shell.
 - Reopening sshai lists resumable sessions and restores the previous layout.
 - Agent actions can open a terminal pane for a named remote, and a terminal pane can launch `sshai --agent NAME` using the same local/remote context.
+- An Agent launched from an authenticated terminal session reuses that session's SSH transport through a token-authenticated local MCP bridge; its workspace and SFTP traffic opens additional channels without a second SSH login.
 
 ## Components
 

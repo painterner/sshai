@@ -3,13 +3,13 @@ use std::{fmt, str::FromStr};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// A user supplied SSH destination and optional remote workspace path.
+/// A user supplied SSH destination and optional URI workspace path.
 ///
 /// Supported forms:
 /// - `host`
 /// - `user@host`
-/// - `host:/absolute/path`
-/// - `user@host:/absolute/path`
+/// - `host:2222`
+/// - `user@host:2222`
 /// - `ssh://user@host:2222/absolute/path`
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Target {
@@ -48,9 +48,8 @@ impl FromStr for Target {
             return Err(ParseTargetError::AmbiguousIpv6);
         }
 
-        let (authority, path) = match value.split_once(':') {
-            Some((authority, "")) => (authority, None),
-            Some((authority, path)) => (authority, Some(path.to_owned())),
+        let (authority, port) = match value.rsplit_once(':') {
+            Some((authority, port)) => (authority, Some(parse_port(port)?)),
             None => (value, None),
         };
         let (user, host) = split_user(authority);
@@ -61,8 +60,8 @@ impl FromStr for Target {
         Ok(Self {
             host: host.to_owned(),
             user,
-            port: None,
-            path,
+            port,
+            path: None,
         })
     }
 }
@@ -112,7 +111,7 @@ fn parse_port(port: &str) -> Result<u16, ParseTargetError> {
 
 impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.port.is_some() || self.host.contains(':') {
+        if self.path.is_some() || self.host.contains(':') {
             f.write_str("ssh://")?;
             if let Some(user) = &self.user {
                 write!(f, "{user}@")?;
@@ -138,8 +137,8 @@ impl fmt::Display for Target {
             write!(f, "{user}@")?;
         }
         f.write_str(&self.host)?;
-        if let Some(path) = &self.path {
-            write!(f, ":{path}")?;
+        if let Some(port) = self.port {
+            write!(f, ":{port}")?;
         }
         Ok(())
     }
@@ -150,12 +149,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_scp_style_target() {
-        let target: Target = "alice@example.com:/srv/app".parse().unwrap();
+    fn parses_bare_target_with_port() {
+        let target: Target = "alice@example.com:2222".parse().unwrap();
         assert_eq!(target.user.as_deref(), Some("alice"));
         assert_eq!(target.host, "example.com");
-        assert_eq!(target.path.as_deref(), Some("/srv/app"));
-        assert_eq!(target.port, None);
+        assert_eq!(target.port, Some(2222));
+        assert_eq!(target.path, None);
     }
 
     #[test]
@@ -176,14 +175,21 @@ mod tests {
     }
 
     #[test]
-    fn empty_scp_path_means_remote_home() {
-        let target: Target = "example.com:".parse().unwrap();
-        assert_eq!(target.path, None);
+    fn rejects_scp_style_paths_as_invalid_ports() {
+        assert_eq!(
+            "example.com:/srv/app".parse::<Target>().unwrap_err(),
+            ParseTargetError::InvalidPort("/srv/app".to_owned())
+        );
+        assert_eq!(
+            "example.com:".parse::<Target>().unwrap_err(),
+            ParseTargetError::InvalidPort(String::new())
+        );
     }
 
     #[test]
     fn display_round_trips_an_explicit_port_and_ipv6() {
         for value in [
+            "alice@example.com:2222",
             "ssh://alice@example.com:2222/srv/app",
             "ssh://alice@[2001:db8::1]:2222/srv/app",
         ] {

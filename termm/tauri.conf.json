@@ -12,11 +12,12 @@
       {
         "label": "main",
         "title": "termm",
-        "width": 1440,
-        "height": 900,
+        "width": 960,
+        "height": 640,
         "minWidth": 760,
         "minHeight": 480,
         "resizable": true,
+        "decorations": false,
         "center": true,
         "visible": false,
         "backgroundColor": [7, 10, 15, 255]

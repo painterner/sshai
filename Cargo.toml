@@ -27,6 +27,7 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 dirs = "6"
 hex = "0.4"
+getrandom = "0.3"
 nix = { version = "0.30", features = ["process", "signal", "term"] }
 rpassword = "7"
 russh = { version = "0.63", default-features = false, features = ["ring", "rsa", "flate2"] }
@@ -41,6 +42,7 @@ tempfile = "3"
 tokio = { version = "1", features = ["fs", "io-std", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+vt100 = "0.16"
 zeroize = "1"
 
 [profile.release]

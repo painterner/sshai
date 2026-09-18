@@ -1,5 +1,4 @@
 use std::{
-    collections::VecDeque,
     env,
     future::Future,
     io::{IsTerminal, Read},
@@ -50,9 +49,22 @@ pub struct SessionCommandResult {
     pub stderr: String,
 }
 
+#[derive(Debug)]
+pub struct SessionInputResult {
+    pub forward: Vec<u8>,
+    pub notice: Option<String>,
+}
+
 #[async_trait::async_trait]
 pub trait SessionCommandHandler: Send {
     fn handles(&self, command: &str) -> bool;
+
+    async fn handle_input(&mut self, input: Vec<u8>) -> SessionInputResult {
+        SessionInputResult {
+            forward: input,
+            notice: None,
+        }
+    }
 
     async fn handle(
         &mut self,
@@ -60,6 +72,7 @@ pub trait SessionCommandHandler: Send {
         arguments: &[String],
         session_index: usize,
         remote_cwd: Option<&str>,
+        sessions: Vec<Option<Arc<SshSession>>>,
     ) -> SessionCommandResult;
 }
 
@@ -72,6 +85,7 @@ struct CapturedCommand {
 struct AgentBootstrap {
     started: Instant,
     remote_platform: RemotePlatform,
+    remote_description: String,
     local_executable: PathBuf,
     digest: String,
     session_id: String,
@@ -90,10 +104,21 @@ struct ProgressiveCleanup {
     session_id: String,
 }
 
-const SHELL_REPLAY_LIMIT: usize = 4 * 1024 * 1024;
+struct ProgressiveShellState {
+    shell_launcher: String,
+    cleanup: ProgressiveCleanup,
+    initial_display: Vec<u8>,
+}
+
+const TERMINAL_SCROLLBACK_ROWS: usize = 10_000;
+const MULTIPLEX_SWITCH_HINT: &str = "\x1b[1;36m[sshai] Shift+Left/Right switches hosts\x1b[0m\r\n";
 const SWITCH_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(30);
+const SWITCH_PREFIX_TIMEOUT: Duration = Duration::from_secs(3);
 const SWITCH_PREVIOUS: &[u8] = b"\x1b[1;6D";
 const SWITCH_NEXT: &[u8] = b"\x1b[1;6C";
+const SWITCH_PREVIOUS_SHIFT_LEFT: &[u8] = b"\x1b[1;2D";
+const SWITCH_NEXT_SHIFT_RIGHT: &[u8] = b"\x1b[1;2C";
+const SWITCH_PREFIX: u8 = 0x1d; // Ctrl+]
 
 enum MultiplexCommand {
     Input(Vec<u8>),
@@ -106,7 +131,7 @@ enum MultiplexCommand {
 enum MultiplexEvent {
     Ready {
         index: usize,
-        shell: MultiplexedShell,
+        shell: Box<MultiplexedShell>,
     },
     Failed {
         index: usize,
@@ -133,38 +158,112 @@ enum MultiplexEvent {
 
 struct MultiplexedShell {
     label: String,
+    workspace_root: String,
+    system_description: String,
     session: Arc<SshSession>,
     commands: mpsc::Sender<MultiplexCommand>,
     start: Option<oneshot::Sender<()>>,
     task: Option<tokio::task::JoinHandle<()>>,
-    replay: ReplayBuffer,
+    terminal: VirtualTerminal,
     open: bool,
 }
 
-#[derive(Default)]
-struct ReplayBuffer {
-    chunks: VecDeque<Vec<u8>>,
-    bytes: usize,
+struct LocalConnectionSummary {
+    workspace_root: String,
+    system_description: String,
 }
 
-impl ReplayBuffer {
-    fn push(&mut self, data: &[u8]) {
-        if data.is_empty() {
-            return;
-        }
-        let data = if data.len() > SHELL_REPLAY_LIMIT {
-            data[data.len() - SHELL_REPLAY_LIMIT..].to_vec()
-        } else {
-            data.to_vec()
-        };
-        self.bytes += data.len();
-        self.chunks.push_back(data);
-        while self.bytes > SHELL_REPLAY_LIMIT && self.chunks.len() > 1 {
-            if let Some(removed) = self.chunks.pop_front() {
-                self.bytes -= removed.len();
-            }
+struct VirtualTerminal {
+    parser: vt100::Parser,
+}
+
+impl VirtualTerminal {
+    fn new(columns: u32, rows: u32) -> Self {
+        Self {
+            parser: vt100::Parser::new(
+                terminal_dimension(rows),
+                terminal_dimension(columns),
+                TERMINAL_SCROLLBACK_ROWS,
+            ),
         }
     }
+
+    fn process(&mut self, data: &[u8]) {
+        self.parser.process(data);
+    }
+
+    fn resize(&mut self, columns: u32, rows: u32) {
+        self.parser
+            .screen_mut()
+            .set_size(terminal_dimension(rows), terminal_dimension(columns));
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        self.parser.screen().contents_formatted()
+    }
+}
+
+fn terminal_dimension(value: u32) -> u16 {
+    value.clamp(1, u32::from(u16::MAX)) as u16
+}
+
+fn system_description(name: &str, arch: &str, memory_bytes: u64) -> String {
+    let mut parts = vec![name.trim().to_owned(), arch.trim().to_owned()];
+    if memory_bytes > 0 {
+        let gib = memory_bytes as f64 / (1024_f64 * 1024_f64 * 1024_f64);
+        let memory = if gib >= 0.75 {
+            format!("{gib:.0} GiB")
+        } else {
+            format!("{} MiB", memory_bytes.div_ceil(1024 * 1024))
+        };
+        parts.push(memory);
+    }
+    parts
+        .into_iter()
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn local_connection_summary() -> LocalConnectionSummary {
+    let workspace_root = env::current_dir()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "?".to_owned());
+    LocalConnectionSummary {
+        workspace_root,
+        system_description: system_description(
+            &local_os_name(),
+            std::env::consts::ARCH,
+            local_memory_bytes(),
+        ),
+    }
+}
+
+fn local_os_name() -> String {
+    #[cfg(target_os = "linux")]
+    if let Ok(contents) = std::fs::read_to_string("/etc/os-release")
+        && let Some(value) = contents.lines().find_map(|line| {
+            line.strip_prefix("PRETTY_NAME=")
+                .map(|value| value.trim_matches('"').to_owned())
+        })
+    {
+        return value;
+    }
+    std::env::consts::OS.to_owned()
+}
+
+fn local_memory_bytes() -> u64 {
+    #[cfg(target_os = "linux")]
+    if let Ok(contents) = std::fs::read_to_string("/proc/meminfo")
+        && let Some(kibibytes) = contents.lines().find_map(|line| {
+            line.strip_prefix("MemTotal:")
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+    {
+        return kibibytes.saturating_mul(1024);
+    }
+    0
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -172,6 +271,10 @@ enum InputAction {
     Previous,
     Next,
 }
+
+const PREFIX_SWITCH_PREVIOUS: &[&[u8]] = &[b"\x1dh", b"\x1d[", b"\x1d\x1b[D", b"\x1d\x1bOD"];
+const PREFIX_SWITCH_NEXT: &[&[u8]] = &[b"\x1dl", b"\x1d]", b"\x1d\x1b[C", b"\x1d\x1bOC"];
+const LITERAL_SWITCH_PREFIX: &[u8] = b"\x1d\x1d";
 
 enum ParsedInput {
     Data(Vec<u8>),
@@ -196,8 +299,21 @@ impl SwitchInputParser {
                 Some((SWITCH_PREVIOUS.len(), InputAction::Previous))
             } else if remaining.starts_with(SWITCH_NEXT) {
                 Some((SWITCH_NEXT.len(), InputAction::Next))
+            } else if remaining.starts_with(SWITCH_PREVIOUS_SHIFT_LEFT) {
+                Some((SWITCH_PREVIOUS_SHIFT_LEFT.len(), InputAction::Previous))
+            } else if remaining.starts_with(SWITCH_NEXT_SHIFT_RIGHT) {
+                Some((SWITCH_NEXT_SHIFT_RIGHT.len(), InputAction::Next))
             } else {
-                None
+                PREFIX_SWITCH_PREVIOUS
+                    .iter()
+                    .find(|sequence| remaining.starts_with(sequence))
+                    .map(|sequence| (sequence.len(), InputAction::Previous))
+                    .or_else(|| {
+                        PREFIX_SWITCH_NEXT
+                            .iter()
+                            .find(|sequence| remaining.starts_with(sequence))
+                            .map(|sequence| (sequence.len(), InputAction::Next))
+                    })
             };
             if let Some((length, action)) = matched {
                 if !data.is_empty() {
@@ -207,7 +323,12 @@ impl SwitchInputParser {
                 index += length;
                 continue;
             }
-            if SWITCH_PREVIOUS.starts_with(remaining) || SWITCH_NEXT.starts_with(remaining) {
+            if remaining.starts_with(LITERAL_SWITCH_PREFIX) {
+                data.push(SWITCH_PREFIX);
+                index += LITERAL_SWITCH_PREFIX.len();
+                continue;
+            }
+            if switch_sequence_starts_with(remaining) {
                 self.pending.extend_from_slice(remaining);
                 break;
             }
@@ -224,9 +345,29 @@ impl SwitchInputParser {
         !self.pending.is_empty()
     }
 
+    fn pending_timeout(&self) -> Duration {
+        if self.pending.first() == Some(&SWITCH_PREFIX) {
+            SWITCH_PREFIX_TIMEOUT
+        } else {
+            SWITCH_SEQUENCE_TIMEOUT
+        }
+    }
+
     fn flush(&mut self) -> Option<Vec<u8>> {
         (!self.pending.is_empty()).then(|| std::mem::take(&mut self.pending))
     }
+}
+
+fn switch_sequence_starts_with(bytes: &[u8]) -> bool {
+    SWITCH_PREVIOUS.starts_with(bytes)
+        || SWITCH_NEXT.starts_with(bytes)
+        || SWITCH_PREVIOUS_SHIFT_LEFT.starts_with(bytes)
+        || SWITCH_NEXT_SHIFT_RIGHT.starts_with(bytes)
+        || LITERAL_SWITCH_PREFIX.starts_with(bytes)
+        || PREFIX_SWITCH_PREVIOUS
+            .iter()
+            .chain(PREFIX_SWITCH_NEXT)
+            .any(|sequence| sequence.starts_with(bytes))
 }
 
 type AgentStartup<'a> = Pin<Box<dyn Future<Output = Result<RemoteAgent>> + Send + 'a>>;
@@ -454,7 +595,7 @@ impl SshConnector {
     /// before background connections to the remaining targets complete.
     pub async fn interactive_shell_multiplexed(
         &self,
-        primary: SshSession,
+        primary: Arc<SshSession>,
         targets: Vec<Target>,
         handler: &mut dyn SessionCommandHandler,
     ) -> Result<CommandExit> {
@@ -661,7 +802,7 @@ impl SshSession {
         tracing::debug!(host = %self.target.host, "remote agent startup beginning");
 
         let phase_started = Instant::now();
-        let remote_platform = self.verify_agent_platform().await?;
+        let (remote_platform, remote_description) = self.verify_agent_platform().await?;
         tracing::debug!(
             elapsed_ms = phase_started.elapsed().as_millis() as u64,
             "remote platform verified"
@@ -731,6 +872,7 @@ impl SshSession {
         Ok(AgentBootstrap {
             started: agent_started,
             remote_platform,
+            remote_description,
             local_executable,
             digest,
             session_id,
@@ -748,6 +890,7 @@ impl SshSession {
         let AgentBootstrap {
             started,
             remote_platform,
+            remote_description: _,
             local_executable,
             digest,
             session_id,
@@ -808,7 +951,8 @@ impl SshSession {
             .await?;
 
         if !prepared {
-            sftp.ensure_dir_all(remote_sessions_dir, 0o700).await?;
+            sftp.ensure_dir_all(remote_sessions_dir.clone(), 0o700)
+                .await?;
         }
         sftp.close().await?;
         tracing::debug!(
@@ -816,17 +960,48 @@ impl SshSession {
             "remote agent session prepared"
         );
         let prepared_argument = if prepared { " --prepared" } else { "" };
+        let worker_stderr = join_remote_path(
+            &remote_sessions_dir,
+            &format!(".{session_id}.worker-stderr"),
+        );
         let command = format!(
-            "exec {} serve{prepared_argument} --session-id {} --session-dir {} --workspace-root {}",
+            "umask 077; exec {} serve{prepared_argument} --session-id {} --session-dir {} --workspace-root {} 2>{}",
             shell_quote(&remote_executable),
             shell_quote(&session_id),
             shell_quote(&remote_session_dir),
             shell_quote(&remote_workspace_root),
+            shell_quote(&worker_stderr),
         );
         let phase_started = Instant::now();
         let channel = self.session.channel_open_session().await?;
         channel.exec(true, command).await?;
-        let agent = RemoteAgent::connect(channel.into_stream(), &session_id).await?;
+        let agent = match RemoteAgent::connect(channel.into_stream(), &session_id).await {
+            Ok(agent) => {
+                let _ = self
+                    .capture_command(&format!("rm -f {}", shell_quote(&worker_stderr)))
+                    .await;
+                agent
+            }
+            Err(error) => {
+                let stderr = self
+                    .capture_command(&format!(
+                        "if test -f {}; then cat {}; rm -f {}; fi",
+                        shell_quote(&worker_stderr),
+                        shell_quote(&worker_stderr),
+                        shell_quote(&worker_stderr),
+                    ))
+                    .await
+                    .ok()
+                    .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+                    .filter(|message| !message.is_empty());
+                return Err(match stderr {
+                    Some(stderr) => {
+                        SshError::Agent(format!("{error}; remote worker stderr: {stderr}"))
+                    }
+                    None => error,
+                });
+            }
+        };
         tracing::debug!(
             elapsed_ms = phase_started.elapsed().as_millis() as u64,
             total_elapsed_ms = started.elapsed().as_millis() as u64,
@@ -1021,8 +1196,22 @@ impl SshSession {
         sftp.sha256(remote.to_owned()).await
     }
 
-    async fn verify_agent_platform(&self) -> Result<RemotePlatform> {
-        let output = self.capture_command("uname -s; uname -m").await?;
+    async fn verify_agent_platform(&self) -> Result<(RemotePlatform, String)> {
+        let output = self
+            .capture_command(
+                "os=$(uname -s); arch=$(uname -m); printf '%s\\n%s\\n' \"$os\" \"$arch\"; \
+                 if test -r /etc/os-release; then \
+                   name=$(sed -n 's/^PRETTY_NAME=//p' /etc/os-release | head -n 1); \
+                   name=${name#\\\"}; name=${name%\\\"}; printf '%s\\n' \"${name:-$os}\"; \
+                 elif command -v sw_vers >/dev/null 2>&1; then \
+                   printf '%s %s\\n' \"$(sw_vers -productName)\" \"$(sw_vers -productVersion)\"; \
+                 else printf '%s\\n' \"$os\"; fi; \
+                 if test -r /proc/meminfo; then \
+                   awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo; \
+                 elif command -v sysctl >/dev/null 2>&1; then sysctl -n hw.memsize 2>/dev/null || printf '0\\n'; \
+                 else printf '0\\n'; fi",
+            )
+            .await?;
         if output.code != Some(0) {
             return Err(SshError::Agent(format!(
                 "cannot detect remote platform: {}",
@@ -1033,6 +1222,11 @@ impl SshSession {
         let mut lines = stdout.lines();
         let remote_os = lines.next().unwrap_or_default().trim();
         let remote_arch = lines.next().unwrap_or_default().trim();
+        let remote_name = lines.next().unwrap_or(remote_os).trim();
+        let memory_value = lines
+            .next()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0);
         let os_matches = matches!(
             (std::env::consts::OS, remote_os),
             ("linux", "Linux") | ("macos", "Darwin")
@@ -1049,27 +1243,36 @@ impl SshSession {
                 std::env::consts::ARCH
             )));
         }
-        Ok(match remote_os {
+        let platform = match remote_os {
             "Linux" => RemotePlatform::Linux,
             "Darwin" => RemotePlatform::Macos,
             _ => unreachable!("unsupported remote OS was rejected above"),
-        })
+        };
+        let memory_bytes = match platform {
+            RemotePlatform::Linux => memory_value.saturating_mul(1024),
+            RemotePlatform::Macos => memory_value,
+        };
+        Ok((
+            platform,
+            system_description(remote_name, remote_arch, memory_bytes),
+        ))
     }
 
     pub async fn interactive_shell(&self) -> Result<CommandExit> {
-        self.interactive_shell_inner(None, None, None, None, None)
+        self.interactive_shell_inner(None, None, None, Vec::new(), None)
             .await
     }
 
     pub async fn interactive_shell_with_agent(&self) -> Result<CommandExit> {
-        self.interactive_shell_progressive(None).await
+        self.interactive_shell_progressive(None, Vec::new()).await
     }
 
     pub async fn interactive_shell_with_agent_handler(
-        &self,
+        self: &Arc<Self>,
         handler: &mut dyn SessionCommandHandler,
     ) -> Result<CommandExit> {
-        self.interactive_shell_progressive(Some(handler)).await
+        self.interactive_shell_progressive(Some(handler), vec![Some(Arc::clone(self))])
+            .await
     }
 
     pub async fn workspace(&self) -> Result<WorkspaceClient> {
@@ -1079,8 +1282,19 @@ impl SshSession {
     async fn interactive_shell_progressive(
         &self,
         handler: Option<&mut dyn SessionCommandHandler>,
+        handler_sessions: Vec<Option<Arc<SshSession>>>,
     ) -> Result<CommandExit> {
         let bootstrap = self.prepare_agent(true).await?;
+        let initial_display = single_connection_overview(
+            &local_connection_summary(),
+            &format!(
+                "{}@{}:{}",
+                self.target.user, self.target.host, self.target.port
+            ),
+            &bootstrap.remote_workspace_root,
+            &bootstrap.remote_description,
+        )
+        .into_bytes();
         let shell_launcher = bootstrap.shell_launcher.clone();
         let cleanup = ProgressiveCleanup {
             remote_session_dir: bootstrap.remote_session_dir.clone(),
@@ -1092,8 +1306,12 @@ impl SshSession {
             None,
             Some(startup),
             handler,
-            Some(shell_launcher),
-            Some(cleanup),
+            handler_sessions,
+            Some(ProgressiveShellState {
+                shell_launcher,
+                cleanup,
+                initial_display,
+            }),
         )
         .await
     }
@@ -1103,8 +1321,8 @@ impl SshSession {
         mut agent: Option<RemoteAgent>,
         mut startup: Option<AgentStartup<'_>>,
         mut handler: Option<&mut dyn SessionCommandHandler>,
-        shell_launcher: Option<String>,
-        cleanup: Option<ProgressiveCleanup>,
+        handler_sessions: Vec<Option<Arc<SshSession>>>,
+        progressive: Option<ProgressiveShellState>,
     ) -> Result<CommandExit> {
         if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
             return Err(SshError::Config(
@@ -1119,7 +1337,10 @@ impl SshSession {
             .request_pty(true, &term, columns, rows, 0, 0, &[])
             .await?;
 
-        match (self.target.path.as_deref(), shell_launcher.as_deref()) {
+        let shell_launcher = progressive
+            .as_ref()
+            .map(|progressive| progressive.shell_launcher.as_str());
+        match (self.target.path.as_deref(), shell_launcher) {
             (path, Some(shell_launcher)) => {
                 let command = build_shell_command(path, Some(shell_launcher));
                 channel.exec(true, command).await?;
@@ -1139,6 +1360,11 @@ impl SshSession {
         let mut code = None;
         let mut signal = None;
 
+        if let Some(progressive) = progressive.as_ref() {
+            stdout.write_all(&progressive.initial_display).await?;
+            stdout.flush().await?;
+        }
+
         let mut resize = ResizeEvents::new()?;
 
         'shell: loop {
@@ -1150,7 +1376,20 @@ impl SshSession {
                         stdin_closed = true;
                         channel.eof().await?;
                     } else {
-                        channel.data_bytes(input[..read].to_vec()).await?;
+                        let mut input = input[..read].to_vec();
+                        if let Some(handler) = handler.as_deref_mut() {
+                            let result = handler.handle_input(input).await;
+                            input = result.forward;
+                            if let Some(notice) = result.notice {
+                                stdout
+                                    .write_all(format!("\r\nsshai: {notice}\r\n").as_bytes())
+                                    .await?;
+                                stdout.flush().await?;
+                            }
+                        }
+                        if !input.is_empty() {
+                            channel.data_bytes(input).await?;
+                        }
                     }
                 }
                 message = channel.wait() => {
@@ -1181,7 +1420,10 @@ impl SshSession {
                     match startup_result {
                         Ok(started_agent) => agent = Some(started_agent),
                         Err(error) => {
-                            if let Some(cleanup) = cleanup.as_ref() {
+                            if let Some(cleanup) = progressive
+                                .as_ref()
+                                .map(|progressive| &progressive.cleanup)
+                            {
                                 if let Err(mark_error) = self
                                     .write_agent_startup_error(&cleanup.remote_session_dir, &error)
                                     .await
@@ -1213,6 +1455,7 @@ impl SshSession {
                                         &request.argv[1..],
                                         0,
                                         request.cwd.as_deref(),
+                                        handler_sessions.clone(),
                                     )
                                     .await;
                                 raw_mode = Some(RawTerminalGuard::activate()?);
@@ -1250,7 +1493,7 @@ impl SshSession {
                 tracing::debug!(%error, "remote agent did not shut down cleanly");
             }
         }
-        if let Some(cleanup) = cleanup {
+        if let Some(cleanup) = progressive.map(|progressive| progressive.cleanup) {
             if let Err(error) = self.cleanup_progressive_session(&cleanup).await {
                 tracing::debug!(%error, "could not clean progressive agent session");
             }
@@ -1302,7 +1545,7 @@ impl SshSession {
         let id = request.id;
         let result = match request.argv.first().map(String::as_str) {
             Some("copy-id") => self.control_copy_id(&request.argv[1..]).await,
-            Some("info") => Ok(format!(
+            Some("info" | "hosts") => Ok(format!(
                 "connected to {}@{}:{}\n",
                 self.target.user, self.target.host, self.target.port
             )),
@@ -1384,7 +1627,7 @@ impl SshSession {
 }
 
 async fn run_multiplexed_shells(
-    primary: SshSession,
+    primary: Arc<SshSession>,
     background_connector: SshConnector,
     targets: Vec<Target>,
     handler: &mut dyn SessionCommandHandler,
@@ -1397,8 +1640,8 @@ async fn run_multiplexed_shells(
 
     let total = targets.len();
     let labels = targets.iter().map(ToString::to_string).collect::<Vec<_>>();
+    let local_summary = local_connection_summary();
     let (events_tx, mut events_rx) = mpsc::channel(256);
-    let primary = Arc::new(primary);
     let primary_shell = prepare_multiplexed_shell(
         0,
         labels[0].clone(),
@@ -1422,18 +1665,15 @@ async fn run_multiplexed_shells(
         .map(|_| None)
         .collect::<Vec<Option<MultiplexedShell>>>();
     shells[0] = Some(primary_shell);
+    let initial_display =
+        initial_multiplexer_display(&labels[0], &local_summary, &shells, &labels, &statuses);
+    shells[0]
+        .as_mut()
+        .expect("primary shell exists")
+        .terminal
+        .process(&initial_display);
     start_multiplexed_shell(shells[0].as_mut().expect("primary shell exists"));
-
-    stdout
-        .write_all(
-            format!(
-                "\r\n\x1b[1;36m[sshai 1/{total}] {} — Ctrl+Shift+←/→ switches hosts\x1b[0m\r\n",
-                display_label(&labels[0])
-            )
-            .as_bytes(),
-        )
-        .await?;
-    stdout.flush().await?;
+    present_initial_multiplexed_shell(&mut stdout, &initial_display).await?;
 
     let mut connection_tasks = Vec::with_capacity(total - 1);
     for (index, target) in targets.into_iter().enumerate().skip(1) {
@@ -1447,7 +1687,10 @@ async fn run_multiplexed_shells(
             }
             .await;
             let event = match result {
-                Ok(shell) => MultiplexEvent::Ready { index, shell },
+                Ok(shell) => MultiplexEvent::Ready {
+                    index,
+                    shell: Box::new(shell),
+                },
                 Err(error) => MultiplexEvent::Failed {
                     index,
                     error: format!("{error}"),
@@ -1461,7 +1704,7 @@ async fn run_multiplexed_shells(
     let mut last_code = None;
     let mut last_signal = None;
     'multiplexer: loop {
-        let pending_timeout = tokio::time::sleep(SWITCH_SEQUENCE_TIMEOUT);
+        let pending_timeout = tokio::time::sleep(parser.pending_timeout());
         tokio::pin!(pending_timeout);
         tokio::select! {
             biased;
@@ -1476,8 +1719,27 @@ async fn run_multiplexed_shells(
                     for parsed in parser.feed(&input[..read]) {
                         match parsed {
                             ParsedInput::Data(data) => {
+                                let mut data = data;
+                                let result = handler.handle_input(data).await;
+                                data = result.forward;
+                                let notice = result.notice;
+                                if let Some(notice) = notice {
+                                    let notice = format!("\r\nsshai: {notice}\r\n").into_bytes();
+                                    if let Some(active_index) = active {
+                                        if let Some(shell) = shells
+                                            .get_mut(active_index)
+                                            .and_then(Option::as_mut)
+                                        {
+                                            shell.terminal.process(&notice);
+                                        }
+                                    }
+                                    stdout.write_all(&notice).await?;
+                                    stdout.flush().await?;
+                                }
                                 if let Some(commands) = active_shell_commands(&shells, active) {
-                                    let _ = commands.send(MultiplexCommand::Input(data)).await;
+                                    if !data.is_empty() {
+                                        let _ = commands.send(MultiplexCommand::Input(data)).await;
+                                    }
                                 }
                             }
                             ParsedInput::Switch(action) => {
@@ -1502,11 +1764,21 @@ async fn run_multiplexed_shells(
             event = events_rx.recv() => {
                 let Some(event) = event else { break 'multiplexer };
                 match event {
-                    MultiplexEvent::Ready { index, mut shell } => {
+                    MultiplexEvent::Ready { index, shell } => {
                         pending_connections = pending_connections.saturating_sub(1);
                         statuses[index] = "connected".to_owned();
-                        start_multiplexed_shell(&mut shell);
-                        shells[index] = Some(shell);
+                        shells[index] = Some(*shell);
+                        let overview = connection_overview(
+                            &local_summary,
+                            &shells,
+                            &labels,
+                            &statuses,
+                            true,
+                        );
+                        if let Some(shell) = shells[index].as_mut() {
+                            shell.terminal.process(overview.as_bytes());
+                            start_multiplexed_shell(shell);
+                        }
                         if active.is_none() {
                             active = Some(index);
                             render_multiplexed_shell(&mut stdout, &shells[index], index, total).await?;
@@ -1521,7 +1793,7 @@ async fn run_multiplexed_shells(
                     }
                     MultiplexEvent::Output { index, data } => {
                         if let Some(shell) = shells.get_mut(index).and_then(Option::as_mut) {
-                            shell.replay.push(&data);
+                            shell.terminal.process(&data);
                             if active == Some(index) {
                                 stdout.write_all(&data).await?;
                                 stdout.flush().await?;
@@ -1531,7 +1803,7 @@ async fn run_multiplexed_shells(
                     MultiplexEvent::WorkerNotice { index, message } => {
                         let notice = format!("\r\nsshai: {message}\r\n").into_bytes();
                         if let Some(shell) = shells.get_mut(index).and_then(Option::as_mut) {
-                            shell.replay.push(&notice);
+                            shell.terminal.process(&notice);
                             if active == Some(index) {
                                 stdout.write_all(&notice).await?;
                                 stdout.flush().await?;
@@ -1547,7 +1819,24 @@ async fn run_multiplexed_shells(
                         let external_command = request.argv.first().and_then(|command| {
                             handler.handles(command).then(|| command.clone())
                         });
-                        let response = if let Some(command) = external_command {
+                        let shows_connections = matches!(
+                            request.argv.as_slice(),
+                            [command] if command == "info" || command == "hosts"
+                        );
+                        let response = if shows_connections {
+                            ControlResponse {
+                                id: request.id,
+                                exit_code: 0,
+                                stdout: connection_overview(
+                                    &local_summary,
+                                    &shells,
+                                    &labels,
+                                    &statuses,
+                                    false,
+                                ),
+                                stderr: String::new(),
+                            }
+                        } else if let Some(command) = external_command {
                             drop(raw_mode.take());
                             let result = handler
                                 .handle(
@@ -1555,6 +1844,15 @@ async fn run_multiplexed_shells(
                                     &request.argv[1..],
                                     index,
                                     request.cwd.as_deref(),
+                                    shells
+                                        .iter()
+                                        .map(|shell| {
+                                            shell
+                                                .as_ref()
+                                                .filter(|shell| shell.open)
+                                                .map(|shell| Arc::clone(&shell.session))
+                                        })
+                                        .collect(),
                                 )
                                 .await;
                             raw_mode = Some(RawTerminalGuard::activate()?);
@@ -1572,11 +1870,20 @@ async fn run_multiplexed_shells(
                             .await;
                     }
                     MultiplexEvent::Exited { index, code, signal } => {
+                        let active_shell_exited_normally = closes_multiplexer_on_exit(
+                            active,
+                            index,
+                            code,
+                            signal.as_deref(),
+                        );
                         last_code = code.or(last_code);
                         last_signal = signal.or(last_signal);
                         statuses[index] = "closed".to_owned();
                         if let Some(shell) = shells.get_mut(index).and_then(Option::as_mut) {
                             shell.open = false;
+                        }
+                        if active_shell_exited_normally {
+                            break 'multiplexer;
                         }
                         if active == Some(index) {
                             active = adjacent_open_shell(&shells, index, InputAction::Next);
@@ -1597,11 +1904,10 @@ async fn run_multiplexed_shells(
             }
             _ = resize.recv() => {
                 let (columns, rows) = terminal_size();
-                for shell in shells.iter().flatten().filter(|shell| shell.open) {
-                    let _ = shell
-                        .commands
-                        .send(MultiplexCommand::Resize(columns, rows))
-                        .await;
+                for shell in shells.iter_mut().flatten().filter(|shell| shell.open) {
+                    shell.terminal.resize(columns, rows);
+                    let commands = shell.commands.clone();
+                    let _ = commands.send(MultiplexCommand::Resize(columns, rows)).await;
                 }
             }
             _ = &mut pending_timeout, if parser.has_pending() => {
@@ -1644,6 +1950,8 @@ async fn prepare_multiplexed_shell(
     events: mpsc::Sender<MultiplexEvent>,
 ) -> Result<MultiplexedShell> {
     let bootstrap = session.prepare_agent(true).await?;
+    let workspace_root = bootstrap.remote_workspace_root.clone();
+    let system_description = bootstrap.remote_description.clone();
     let cleanup = ProgressiveCleanup {
         remote_session_dir: bootstrap.remote_session_dir.clone(),
         remote_executable: bootstrap.remote_executable.clone(),
@@ -1675,13 +1983,16 @@ async fn prepare_multiplexed_shell(
         )
         .await;
     });
+    let terminal = VirtualTerminal::new(columns, rows);
     Ok(MultiplexedShell {
         label,
+        workspace_root,
+        system_description,
         session,
         commands,
         start: Some(start),
         task: Some(task),
-        replay: ReplayBuffer::default(),
+        terminal,
         open: true,
     })
 }
@@ -1849,6 +2160,15 @@ fn adjacent_open_shell(
         .find(|index| shells[*index].as_ref().is_some_and(|shell| shell.open))
 }
 
+fn closes_multiplexer_on_exit(
+    active: Option<usize>,
+    exited: usize,
+    code: Option<u32>,
+    signal: Option<&str>,
+) -> bool {
+    active == Some(exited) && (code.is_some() || signal.is_some())
+}
+
 async fn render_multiplexed_shell(
     stdout: &mut tokio::io::Stdout,
     shell: &Option<MultiplexedShell>,
@@ -1857,31 +2177,129 @@ async fn render_multiplexed_shell(
 ) -> Result<()> {
     let shell = shell.as_ref().expect("rendered shell must exist");
     let label = display_label(&shell.label);
+    let snapshot = shell.terminal.snapshot();
     stdout
         .write_all(
             format!(
-                "\x1b]0;sshai [{}/{}] {label}\x07\x1b[2J\x1b[H",
+                "\x1b]0;sshai [{}/{}] {label} — Shift+←/→\x07",
                 index + 1,
                 total
             )
             .as_bytes(),
         )
         .await?;
-    stdout
-        .write_all(
-            format!(
-                "\x1b[1;36m[sshai {}/{}] {label} — Ctrl+Shift+←/→ switches hosts\x1b[0m\r\n",
-                index + 1,
-                total
-            )
-            .as_bytes(),
-        )
-        .await?;
-    for chunk in &shell.replay.chunks {
-        stdout.write_all(chunk).await?;
-    }
+    stdout.write_all(&snapshot).await?;
     stdout.flush().await?;
     Ok(())
+}
+
+async fn present_initial_multiplexed_shell(
+    stdout: &mut tokio::io::Stdout,
+    display: &[u8],
+) -> Result<()> {
+    stdout.write_all(display).await?;
+    stdout.flush().await?;
+    Ok(())
+}
+
+fn initial_multiplexer_display(
+    label: &str,
+    local: &LocalConnectionSummary,
+    shells: &[Option<MultiplexedShell>],
+    labels: &[String],
+    statuses: &[String],
+) -> Vec<u8> {
+    format!(
+        "\x1b]0;sshai [1/{}] {} — Shift+←/→\x07{}",
+        labels.len(),
+        display_label(label),
+        connection_overview(local, shells, labels, statuses, true),
+    )
+    .into_bytes()
+}
+
+fn connection_overview(
+    local: &LocalConnectionSummary,
+    shells: &[Option<MultiplexedShell>],
+    labels: &[String],
+    statuses: &[String],
+    ansi: bool,
+) -> String {
+    let newline = if ansi { "\r\n" } else { "\n" };
+    let mut output = if ansi {
+        format!("\x1b[1;36m[sshai connections]\x1b[0m{newline}")
+    } else {
+        format!("sshai connections{newline}")
+    };
+    let local_line = format!(
+        "  1. local: {} ({}){newline}",
+        display_label(&local.workspace_root),
+        display_label(&local.system_description),
+    );
+    if ansi {
+        output.push_str("\x1b[32m");
+        output.push_str(&local_line);
+        output.push_str("\x1b[0m");
+    } else {
+        output.push_str(&local_line);
+    }
+    for (index, label) in labels.iter().enumerate() {
+        let mut line = format!("  {}. {}: ", index + 2, display_label(label));
+        if let Some(shell) = shells.get(index).and_then(Option::as_ref) {
+            line.push_str(&format!(
+                "{} ({})",
+                display_label(&shell.workspace_root),
+                display_label(&shell.system_description),
+            ));
+        } else {
+            line.push_str(&display_label(
+                statuses
+                    .get(index)
+                    .map(String::as_str)
+                    .unwrap_or("connecting"),
+            ));
+        }
+        line.push_str(newline);
+        if ansi {
+            let color = if shells.get(index).and_then(Option::as_ref).is_some() {
+                32
+            } else if statuses
+                .get(index)
+                .is_some_and(|status| status.starts_with("failed:") || status == "closed")
+            {
+                31
+            } else {
+                33
+            };
+            output.push_str(&format!("\x1b[{color}m{line}\x1b[0m"));
+        } else {
+            output.push_str(&line);
+        }
+    }
+    if ansi {
+        output.push_str(MULTIPLEX_SWITCH_HINT);
+    }
+    output
+}
+
+fn single_connection_overview(
+    local: &LocalConnectionSummary,
+    label: &str,
+    workspace_root: &str,
+    remote_description: &str,
+) -> String {
+    let local = format!(
+        "  1. local: {} ({})\r\n",
+        display_label(&local.workspace_root),
+        display_label(&local.system_description),
+    );
+    let remote = format!(
+        "  2. {}: {} ({})\r\n",
+        display_label(label),
+        display_label(workspace_root),
+        display_label(remote_description),
+    );
+    format!("\x1b[1;36m[sshai connections]\x1b[0m\r\n\x1b[32m{local}\x1b[0m\x1b[32m{remote}\x1b[0m")
 }
 
 async fn write_multiplexer_status(
@@ -1960,21 +2378,45 @@ async fn receive_agent_startup(startup: &mut Option<AgentStartup<'_>>) -> Result
 }
 
 fn locate_worker_executable(configured: Option<&Path>) -> Result<PathBuf> {
-    let path = if let Some(configured) = configured {
-        configured.to_owned()
-    } else if let Some(configured) = std::env::var_os("SSHAI_WORKER") {
-        PathBuf::from(configured)
-    } else {
-        let current = std::env::current_exe().map_err(SshError::Io)?;
-        current.with_file_name(format!("sshai-worker{}", std::env::consts::EXE_SUFFIX))
-    };
-    if !path.is_file() {
+    if let Some(path) = configured
+        .map(Path::to_owned)
+        .or_else(|| std::env::var_os("SSHAI_WORKER").map(PathBuf::from))
+    {
+        if path.is_file() {
+            return Ok(path);
+        }
         return Err(SshError::Config(format!(
             "cannot find the local sshai-worker companion at {}; reinstall sshai or set SSHAI_WORKER",
             path.display()
         )));
     }
-    Ok(path)
+    let current = std::env::current_exe().map_err(SshError::Io)?;
+    let candidates = worker_candidate_paths(&current);
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .cloned()
+        .ok_or_else(|| {
+            SshError::Config(format!(
+                "cannot find a local sshai-worker companion; tried {}. Reinstall sshai or set SSHAI_WORKER",
+                candidates
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+        })
+}
+
+fn worker_candidate_paths(current_executable: &Path) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if cfg!(target_os = "linux") {
+        candidates.push(current_executable.with_file_name("sshai-worker-static"));
+    }
+    candidates.push(
+        current_executable.with_file_name(format!("sshai-worker{}", std::env::consts::EXE_SUFFIX)),
+    );
+    candidates
 }
 
 async fn compress_worker(path: &Path, compression: WorkerCompression) -> Option<Vec<u8>> {
@@ -2135,8 +2577,10 @@ fn fish_quote(value: &str) -> String {
 fn control_help() -> &'static str {
     "sshai session commands:\n\
   sshai --agent NAME [-- AGENT_ARGUMENTS...]  (codex, claude, gemini, opencode, ...)\n\
+  sshai --file PROGRAM REMOTE_FILE  (edit locally; Ctrl+Q exits and keeps syncing)\n\
   sshai copy-id [-i LOCAL_KEY] [--authorized-keys REMOTE_PATH]\n\
   sshai info\n\
+  sshai hosts\n\
   sshai help\n\
 \n\
 Agent names after --agent are resolved on the local machine. Known agents use built-in adapters;\n\
@@ -2144,7 +2588,8 @@ other executables must advertise MCP support and receive the generic MCP environ
 These commands run through the encrypted session control channel. LOCAL_KEY is\n\
 read on your local machine; quote paths containing '~' to prevent the remote\n\
 shell from expanding them first, for example: sshai copy-id -i '~/.ssh/id_ed25519.pub'\n\
-In a multi-host session, use Ctrl+Shift+Left/Right to switch the active host.\n"
+In a multi-host session, use Shift+Left/Right to switch hosts. Ctrl+Shift+Left/Right and\n\
+Ctrl+] followed by Left/Right (or h/l) are also supported.\n"
 }
 
 fn parse_copy_id_arguments(arguments: &[String]) -> Result<(Option<PathBuf>, Option<String>)> {
@@ -2432,6 +2877,23 @@ mod tests {
     }
 
     #[test]
+    fn linux_prefers_the_portable_static_worker() {
+        let candidates = worker_candidate_paths(Path::new("/opt/sshai/bin/sshai"));
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                candidates[0],
+                PathBuf::from("/opt/sshai/bin/sshai-worker-static")
+            );
+        }
+        assert!(
+            candidates
+                .last()
+                .unwrap()
+                .ends_with(format!("sshai-worker{}", std::env::consts::EXE_SUFFIX))
+        );
+    }
+
+    #[test]
     fn progressive_session_shim_waits_for_the_worker_socket() {
         let files = session_support_files(
             "/tmp/session",
@@ -2481,6 +2943,43 @@ mod tests {
     }
 
     #[test]
+    fn parses_terminator_safe_multi_host_switch_prefix() {
+        let mut parser = SwitchInputParser::default();
+        assert!(parser.feed(&[SWITCH_PREFIX]).is_empty());
+        assert_eq!(parser.pending_timeout(), SWITCH_PREFIX_TIMEOUT);
+        assert!(matches!(
+            parser.feed(b"\x1b[C").as_slice(),
+            [ParsedInput::Switch(InputAction::Next)]
+        ));
+        assert!(matches!(
+            parser.feed(b"\x1dh").as_slice(),
+            [ParsedInput::Switch(InputAction::Previous)]
+        ));
+        assert!(matches!(
+            parser.feed(LITERAL_SWITCH_PREFIX).as_slice(),
+            [ParsedInput::Data(data)] if data == &[SWITCH_PREFIX]
+        ));
+    }
+
+    #[test]
+    fn parses_single_chord_shift_arrow_host_switches() {
+        let mut parser = SwitchInputParser::default();
+        assert!(matches!(
+            parser.feed(SWITCH_PREVIOUS_SHIFT_LEFT).as_slice(),
+            [ParsedInput::Switch(InputAction::Previous)]
+        ));
+        assert!(matches!(
+            parser.feed(SWITCH_NEXT_SHIFT_RIGHT).as_slice(),
+            [ParsedInput::Switch(InputAction::Next)]
+        ));
+        assert!(parser.feed(b"\x1b").is_empty());
+        assert!(matches!(
+            parser.feed(b"[1;2C").as_slice(),
+            [ParsedInput::Switch(InputAction::Next)]
+        ));
+    }
+
+    #[test]
     fn forwards_incomplete_escape_sequence_after_timeout() {
         let mut parser = SwitchInputParser::default();
         assert!(parser.feed(b"\x1b").is_empty());
@@ -2488,15 +2987,83 @@ mod tests {
     }
 
     #[test]
-    fn bounds_multi_host_terminal_replay() {
-        let mut replay = ReplayBuffer::default();
-        replay.push(&vec![b'a'; SHELL_REPLAY_LIMIT]);
-        replay.push(b"tail");
+    fn multi_host_virtual_terminal_restores_only_the_visible_screen() {
+        let mut terminal = VirtualTerminal::new(8, 2);
+        terminal.process(b"first\r\nsecond\r\ntail");
 
-        assert!(replay.bytes <= SHELL_REPLAY_LIMIT + 4);
+        let snapshot = terminal.snapshot();
+        let mut restored = vt100::Parser::new(2, 8, 0);
+        restored.process(&snapshot);
+
+        assert_eq!(restored.screen().contents(), "second\ntail");
+        assert!(!snapshot.windows(5).any(|window| window == b"first"));
+    }
+
+    #[test]
+    fn multi_host_virtual_terminal_includes_switch_hint_once() {
+        let mut terminal = VirtualTerminal::new(80, 24);
+        terminal.process(MULTIPLEX_SWITCH_HINT.as_bytes());
+        terminal.process(b"prompt> ");
+
+        let snapshot = terminal.snapshot();
+        let mut restored = vt100::Parser::new(24, 80, 0);
+        restored.process(&snapshot);
+        let contents = restored.screen().contents();
+
         assert_eq!(
-            replay.chunks.back().map(Vec::as_slice),
-            Some(b"tail".as_slice())
+            contents
+                .matches("[sshai] Shift+Left/Right switches hosts")
+                .count(),
+            1
         );
+        assert!(contents.contains("prompt>"));
+    }
+
+    #[test]
+    fn initial_multi_host_display_preserves_the_existing_terminal() {
+        let local = LocalConnectionSummary {
+            workspace_root: "/home/test".to_owned(),
+            system_description: "Test Linux, x86_64, 4 GiB".to_owned(),
+        };
+        let labels = vec!["host1".to_owned(), "host2".to_owned()];
+        let statuses = vec!["connected".to_owned(), "connecting".to_owned()];
+        let shells = (0..2)
+            .map(|_| None)
+            .collect::<Vec<Option<MultiplexedShell>>>();
+        let display = initial_multiplexer_display("host1", &local, &shells, &labels, &statuses);
+
+        assert!(display.windows(7).any(|window| window == b"Shift+L"));
+        let text = String::from_utf8_lossy(&display);
+        assert!(text.contains("1. local: /home/test (Test Linux, x86_64, 4 GiB)"));
+        assert!(text.contains("3. host2: connecting"));
+        assert!(text.contains("\x1b[32m  1. local:"));
+        assert!(text.contains("\x1b[33m  3. host2: connecting"));
+        assert!(!display.windows(4).any(|window| window == b"\x1b[2J"));
+        assert!(!display.windows(4).any(|window| window == b"\x1b[3J"));
+        assert!(!display.windows(3).any(|window| window == b"\x1b[H"));
+    }
+
+    #[test]
+    fn single_connection_overview_colors_connected_rows() {
+        let local = LocalConnectionSummary {
+            workspace_root: "/home/test".to_owned(),
+            system_description: "Ubuntu, x86_64, 4 GiB".to_owned(),
+        };
+        let display = single_connection_overview(
+            &local,
+            "root@example",
+            "/root/test",
+            "Ubuntu, x86_64, 4 GiB",
+        );
+        assert!(display.contains("\x1b[32m  1. local:"));
+        assert!(display.contains("\x1b[32m  2. root@example:"));
+    }
+
+    #[test]
+    fn normal_exit_of_active_host_closes_the_whole_multiplexer() {
+        assert!(closes_multiplexer_on_exit(Some(1), 1, Some(0), None));
+        assert!(closes_multiplexer_on_exit(Some(1), 1, None, Some("TERM")));
+        assert!(!closes_multiplexer_on_exit(Some(0), 1, Some(0), None));
+        assert!(!closes_multiplexer_on_exit(Some(1), 1, None, None));
     }
 }
