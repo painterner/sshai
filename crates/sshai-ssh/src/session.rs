@@ -119,6 +119,7 @@ const SWITCH_NEXT: &[u8] = b"\x1b[1;6C";
 const SWITCH_PREVIOUS_SHIFT_LEFT: &[u8] = b"\x1b[1;2D";
 const SWITCH_NEXT_SHIFT_RIGHT: &[u8] = b"\x1b[1;2C";
 const SWITCH_PREFIX: u8 = 0x1d; // Ctrl+]
+const PASSTHROUGH_TOGGLE: u8 = 0x1c; // Ctrl+\\
 
 enum MultiplexCommand {
     Input(Vec<u8>),
@@ -279,6 +280,7 @@ const LITERAL_SWITCH_PREFIX: &[u8] = b"\x1d\x1d";
 enum ParsedInput {
     Data(Vec<u8>),
     Switch(InputAction),
+    TogglePassthrough,
 }
 
 #[derive(Default)]
@@ -287,7 +289,7 @@ struct SwitchInputParser {
 }
 
 impl SwitchInputParser {
-    fn feed(&mut self, input: &[u8]) -> Vec<ParsedInput> {
+    fn feed(&mut self, input: &[u8], multiplex: bool) -> Vec<ParsedInput> {
         let mut bytes = std::mem::take(&mut self.pending);
         bytes.extend_from_slice(input);
         let mut parsed = Vec::new();
@@ -295,6 +297,19 @@ impl SwitchInputParser {
         let mut index = 0;
         while index < bytes.len() {
             let remaining = &bytes[index..];
+            if remaining[0] == PASSTHROUGH_TOGGLE {
+                if !data.is_empty() {
+                    parsed.push(ParsedInput::Data(std::mem::take(&mut data)));
+                }
+                parsed.push(ParsedInput::TogglePassthrough);
+                index += 1;
+                continue;
+            }
+            if !multiplex {
+                data.push(bytes[index]);
+                index += 1;
+                continue;
+            }
             let matched = if remaining.starts_with(SWITCH_PREVIOUS) {
                 Some((SWITCH_PREVIOUS.len(), InputAction::Previous))
             } else if remaining.starts_with(SWITCH_NEXT) {
@@ -1357,6 +1372,8 @@ impl SshSession {
         let mut stdout = tokio::io::stdout();
         let mut input = [0_u8; 8192];
         let mut stdin_closed = false;
+        let mut input_parser = SwitchInputParser::default();
+        let mut passthrough = false;
         let mut code = None;
         let mut signal = None;
 
@@ -1376,19 +1393,51 @@ impl SshSession {
                         stdin_closed = true;
                         channel.eof().await?;
                     } else {
-                        let mut input = input[..read].to_vec();
-                        if let Some(handler) = handler.as_deref_mut() {
-                            let result = handler.handle_input(input).await;
-                            input = result.forward;
-                            if let Some(notice) = result.notice {
-                                stdout
-                                    .write_all(format!("\r\nsshai: {notice}\r\n").as_bytes())
-                                    .await?;
-                                stdout.flush().await?;
+                        for parsed in input_parser.feed(&input[..read], false) {
+                            match parsed {
+                                ParsedInput::Data(mut data) => {
+                                    if !passthrough {
+                                        if let Some(handler) = handler.as_deref_mut() {
+                                            let result = handler.handle_input(data).await;
+                                            data = result.forward;
+                                            if let Some(notice) = result.notice {
+                                                stdout
+                                                    .write_all(
+                                                        format!("\r\nsshai: {notice}\r\n").as_bytes(),
+                                                    )
+                                                    .await?;
+                                                stdout.flush().await?;
+                                            }
+                                        }
+                                    }
+                                    if !data.is_empty() {
+                                        channel.data_bytes(data).await?;
+                                    }
+                                }
+                                ParsedInput::TogglePassthrough => {
+                                    passthrough = !passthrough;
+                                    channel
+                                        .data_bytes(passthrough_export(passthrough))
+                                        .await?;
+                                    stdout
+                                        .write_all(
+                                            format!(
+                                                "\r\n\x1b[1;33m[sshai] {} mode; Ctrl+\\ toggles\x1b[0m\r\n",
+                                                if passthrough {
+                                                    "remote passthrough"
+                                                } else {
+                                                    "smart"
+                                                }
+                                            )
+                                            .as_bytes(),
+                                        )
+                                        .await?;
+                                    stdout.flush().await?;
+                                }
+                                ParsedInput::Switch(_) => unreachable!(
+                                    "single-host input parser does not parse host switches"
+                                ),
                             }
-                        }
-                        if !input.is_empty() {
-                            channel.data_bytes(input).await?;
                         }
                     }
                 }
@@ -1657,6 +1706,7 @@ async fn run_multiplexed_shells(
     let mut parser = SwitchInputParser::default();
     let mut resize = ResizeEvents::new()?;
     let mut stdin_closed = false;
+    let mut passthrough = false;
     let mut active = Some(0_usize);
     let mut pending_connections = total - 1;
     let mut statuses = vec!["connecting".to_owned(); total];
@@ -1716,13 +1766,17 @@ async fn run_multiplexed_shells(
                         let _ = shell.commands.send(MultiplexCommand::Eof).await;
                     }
                 } else {
-                    for parsed in parser.feed(&input[..read]) {
+                    for parsed in parser.feed(&input[..read], !passthrough) {
                         match parsed {
                             ParsedInput::Data(data) => {
                                 let mut data = data;
-                                let result = handler.handle_input(data).await;
-                                data = result.forward;
-                                let notice = result.notice;
+                                let notice = if passthrough {
+                                    None
+                                } else {
+                                    let result = handler.handle_input(data).await;
+                                    data = result.forward;
+                                    result.notice
+                                };
                                 if let Some(notice) = notice {
                                     let notice = format!("\r\nsshai: {notice}\r\n").into_bytes();
                                     if let Some(active_index) = active {
@@ -1742,10 +1796,40 @@ async fn run_multiplexed_shells(
                                     }
                                 }
                             }
+                            ParsedInput::TogglePassthrough => {
+                                passthrough = !passthrough;
+                                if let Some(commands) = active_shell_commands(&shells, active) {
+                                    let _ = commands
+                                        .send(MultiplexCommand::Input(passthrough_export(passthrough)))
+                                        .await;
+                                }
+                                let notice = format!(
+                                    "\r\n\x1b[1;33m[sshai] {} mode; Ctrl+\\ toggles\x1b[0m\r\n",
+                                    if passthrough { "remote passthrough" } else { "smart" }
+                                )
+                                .into_bytes();
+                                if let Some(active_index) = active {
+                                    if let Some(shell) = shells
+                                        .get_mut(active_index)
+                                        .and_then(Option::as_mut)
+                                    {
+                                        shell.terminal.process(&notice);
+                                    }
+                                }
+                                stdout.write_all(&notice).await?;
+                                stdout.flush().await?;
+                            }
                             ParsedInput::Switch(action) => {
                                 if let Some(current) = active {
                                     if let Some(next) = adjacent_open_shell(&shells, current, action) {
                                         active = Some(next);
+                                        if passthrough {
+                                            if let Some(commands) = active_shell_commands(&shells, active) {
+                                                let _ = commands
+                                                    .send(MultiplexCommand::Input(passthrough_export(true)))
+                                                    .await;
+                                            }
+                                        }
                                         render_multiplexed_shell(&mut stdout, &shells[next], next, total).await?;
                                     } else {
                                         write_multiplexer_status(
@@ -1778,6 +1862,14 @@ async fn run_multiplexed_shells(
                         if let Some(shell) = shells[index].as_mut() {
                             shell.terminal.process(overview.as_bytes());
                             start_multiplexed_shell(shell);
+                        }
+                        if passthrough {
+                            if let Some(shell) = shells[index].as_ref() {
+                                let _ = shell
+                                    .commands
+                                    .send(MultiplexCommand::Input(passthrough_export(true)))
+                                    .await;
+                            }
                         }
                         if active.is_none() {
                             active = Some(index);
@@ -1888,6 +1980,13 @@ async fn run_multiplexed_shells(
                         if active == Some(index) {
                             active = adjacent_open_shell(&shells, index, InputAction::Next);
                             if let Some(next) = active {
+                                if passthrough {
+                                    if let Some(commands) = active_shell_commands(&shells, active) {
+                                        let _ = commands
+                                            .send(MultiplexCommand::Input(passthrough_export(true)))
+                                            .await;
+                                    }
+                                }
                                 render_multiplexed_shell(&mut stdout, &shells[next], next, total).await?;
                             } else if pending_connections > 0 {
                                 stdout
@@ -2167,6 +2266,10 @@ fn closes_multiplexer_on_exit(
     signal: Option<&str>,
 ) -> bool {
     active == Some(exited) && (code.is_some() || signal.is_some())
+}
+
+fn passthrough_export(enabled: bool) -> Vec<u8> {
+    format!("export SSHAI_PASSTHROUGH={}\n", if enabled { 1 } else { 0 }).into_bytes()
 }
 
 async fn render_multiplexed_shell(
@@ -2525,7 +2628,11 @@ exec {} invoke --session-id {} --socket {quoted_socket} -- \"$@\"\n",
     let quoted_bashrc = shell_quote(&bashrc);
     let quoted_shrc = shell_quote(&shrc);
     let quoted_zsh_dir = shell_quote(&zsh_dir);
-    let fish_init = shell_quote(&format!("set -gx PATH {} $PATH", fish_quote(&bin_dir)));
+    let fish_init = shell_quote(&format!(
+        "set -gx SSHAI_SESSION_BIN {}; set -gx PATH {} $PATH",
+        fish_quote(&bin_dir),
+        fish_quote(&bin_dir)
+    ));
     let launcher_body = format!(
         "#!/bin/sh\n\
 shell=${{SHELL:-/bin/sh}}\n\
@@ -2543,12 +2650,14 @@ if [ -r \"$HOME/.bash_profile\" ]; then . \"$HOME/.bash_profile\"\n\
 elif [ -r \"$HOME/.bash_login\" ]; then . \"$HOME/.bash_login\"\n\
 elif [ -r \"$HOME/.profile\" ]; then . \"$HOME/.profile\"\n\
 fi\n\
-export PATH={quoted_bin}:\"$PATH\"\n"
+export PATH={quoted_bin}:\"$PATH\"\n\
+export SSHAI_SESSION_BIN={quoted_bin}\n"
     );
     let shrc_body = format!(
         "if [ -r /etc/profile ]; then . /etc/profile; fi\n\
 if [ -r \"$HOME/.profile\" ]; then . \"$HOME/.profile\"; fi\n\
-export PATH={quoted_bin}:\"$PATH\"\n"
+export PATH={quoted_bin}:\"$PATH\"\n\
+export SSHAI_SESSION_BIN={quoted_bin}\n"
     );
 
     let mut files = vec![
@@ -2563,9 +2672,35 @@ export PATH={quoted_bin}:\"$PATH\"\n"
 if [[ -r \"$original\" ]]; then source \"$original\"; fi\n\
 unset original\n\
 export ZDOTDIR={quoted_zsh_dir}\n\
-export PATH={quoted_bin}:$PATH\n"
+export PATH={quoted_bin}:$PATH\n\
+export SSHAI_SESSION_BIN={quoted_bin}\n"
         );
         files.push((join_remote_path(&zsh_dir, name), body, 0o600));
+    }
+    for (name, arguments) in [
+        ("code", "--file code"),
+        ("codex", "--agent codex"),
+        ("claude", "--agent claude"),
+        ("gemini", "--agent gemini"),
+        ("opencode", "--agent opencode"),
+        ("kimi", "--agent kimi"),
+    ] {
+        let body = [
+            "#!/bin/sh\n",
+            "if [ \"${SSHAI_PASSTHROUGH:-0}\" = 1 ]; then\n",
+            "  PATH=\"${PATH#\"$SSHAI_SESSION_BIN:\"}\"; export PATH\n",
+            "  real=$(command -v ",
+            name,
+            " 2>/dev/null || true)\n",
+            "  if [ -z \"$real\" ]; then printf '%s\\n' 'sshai: remote command ",
+            name,
+            " is not installed' >&2; exit 127; fi\n",
+            "  exec \"$real\" \"$@\"\n",
+            "fi\n",
+            &format!("exec \"$SSHAI_SESSION_BIN/sshai\" {arguments} \"$@\"\n"),
+        ]
+        .concat();
+        files.push((join_remote_path(&bin_dir, name), body, 0o700));
     }
     files
 }
@@ -2589,7 +2724,8 @@ These commands run through the encrypted session control channel. LOCAL_KEY is\n
 read on your local machine; quote paths containing '~' to prevent the remote\n\
 shell from expanding them first, for example: sshai copy-id -i '~/.ssh/id_ed25519.pub'\n\
 In a multi-host session, use Shift+Left/Right to switch hosts. Ctrl+Shift+Left/Right and\n\
-Ctrl+] followed by Left/Right (or h/l) are also supported.\n"
+Ctrl+] followed by Left/Right (or h/l) are also supported.\n\
+Ctrl+\\\\ toggles smart command wrappers; passthrough mode uses the remote commands.\n"
 }
 
 fn parse_copy_id_arguments(arguments: &[String]) -> Result<(Option<PathBuf>, Option<String>)> {
@@ -2909,6 +3045,13 @@ mod tests {
         assert!(shim.contains("worker is initializing"));
         assert!(shim.contains("while [ ! -S '/tmp/session/agent.sock' ]"));
         assert!(shim.contains("'/tmp/cache/sshai-worker' invoke"));
+        let codex = files
+            .iter()
+            .find(|(path, _, _)| path.ends_with("/bin/codex"))
+            .map(|(_, body, _)| body.as_str())
+            .unwrap();
+        assert!(codex.contains("SSHAI_PASSTHROUGH"));
+        assert!(codex.contains("--agent codex"));
     }
 
     #[test]
@@ -2925,11 +3068,11 @@ mod tests {
     #[test]
     fn parses_split_multi_host_switch_sequences_without_forwarding_them() {
         let mut parser = SwitchInputParser::default();
-        let first = parser.feed(b"echo ok\n\x1b[1;");
+        let first = parser.feed(b"echo ok\n\x1b[1;", true);
         assert!(matches!(first.as_slice(), [ParsedInput::Data(data)] if data == b"echo ok\n"));
         assert!(parser.has_pending());
 
-        let second = parser.feed(b"6Ctail");
+        let second = parser.feed(b"6Ctail", true);
         assert!(matches!(
             second.as_slice(),
             [ParsedInput::Switch(InputAction::Next), ParsedInput::Data(data)] if data == b"tail"
@@ -2937,7 +3080,7 @@ mod tests {
         assert!(!parser.has_pending());
 
         assert!(matches!(
-            parser.feed(SWITCH_PREVIOUS).as_slice(),
+            parser.feed(SWITCH_PREVIOUS, true).as_slice(),
             [ParsedInput::Switch(InputAction::Previous)]
         ));
     }
@@ -2945,19 +3088,23 @@ mod tests {
     #[test]
     fn parses_terminator_safe_multi_host_switch_prefix() {
         let mut parser = SwitchInputParser::default();
-        assert!(parser.feed(&[SWITCH_PREFIX]).is_empty());
+        assert!(parser.feed(&[SWITCH_PREFIX], true).is_empty());
         assert_eq!(parser.pending_timeout(), SWITCH_PREFIX_TIMEOUT);
         assert!(matches!(
-            parser.feed(b"\x1b[C").as_slice(),
+            parser.feed(b"\x1b[C", true).as_slice(),
             [ParsedInput::Switch(InputAction::Next)]
         ));
         assert!(matches!(
-            parser.feed(b"\x1dh").as_slice(),
+            parser.feed(b"\x1dh", true).as_slice(),
             [ParsedInput::Switch(InputAction::Previous)]
         ));
         assert!(matches!(
-            parser.feed(LITERAL_SWITCH_PREFIX).as_slice(),
+            parser.feed(LITERAL_SWITCH_PREFIX, true).as_slice(),
             [ParsedInput::Data(data)] if data == &[SWITCH_PREFIX]
+        ));
+        assert!(matches!(
+            parser.feed(&[PASSTHROUGH_TOGGLE], true).as_slice(),
+            [ParsedInput::TogglePassthrough]
         ));
     }
 
@@ -2965,16 +3112,16 @@ mod tests {
     fn parses_single_chord_shift_arrow_host_switches() {
         let mut parser = SwitchInputParser::default();
         assert!(matches!(
-            parser.feed(SWITCH_PREVIOUS_SHIFT_LEFT).as_slice(),
+            parser.feed(SWITCH_PREVIOUS_SHIFT_LEFT, true).as_slice(),
             [ParsedInput::Switch(InputAction::Previous)]
         ));
         assert!(matches!(
-            parser.feed(SWITCH_NEXT_SHIFT_RIGHT).as_slice(),
+            parser.feed(SWITCH_NEXT_SHIFT_RIGHT, true).as_slice(),
             [ParsedInput::Switch(InputAction::Next)]
         ));
-        assert!(parser.feed(b"\x1b").is_empty());
+        assert!(parser.feed(b"\x1b", true).is_empty());
         assert!(matches!(
-            parser.feed(b"[1;2C").as_slice(),
+            parser.feed(b"[1;2C", true).as_slice(),
             [ParsedInput::Switch(InputAction::Next)]
         ));
     }
@@ -2982,7 +3129,7 @@ mod tests {
     #[test]
     fn forwards_incomplete_escape_sequence_after_timeout() {
         let mut parser = SwitchInputParser::default();
-        assert!(parser.feed(b"\x1b").is_empty());
+        assert!(parser.feed(b"\x1b", true).is_empty());
         assert_eq!(parser.flush().as_deref(), Some(b"\x1b".as_slice()));
     }
 

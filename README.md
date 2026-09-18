@@ -102,6 +102,8 @@ sshai copy-id
 sshai copy-id -i '~/.ssh/id_ed25519.pub'
 ```
 
+在普通的带 worker 会话中，常用命令也可以直接输入：`codex`、`claude`、`gemini`、`opencode`、`kimi` 会自动调用本机 Agent，`code remote.txt` 会自动进入本机文件编辑模式；这些命令只在 sshai 私有 PATH 中包装，不会修改远端系统。按 `Ctrl+\\` 可切换为 passthrough 模式，此时包装命令让位给远端真实可执行文件，再按一次恢复智能模式。
+
 执行 `sshai --file PROGRAM REMOTE_FILE` 会在当前本地机器上打开远程文件并进入文件编辑模式。文件通过当前已认证的 SSH/SFTP 通道下载到临时文件，编辑期间每 500 ms 检测并自动回传修改；按 `Ctrl+Q` 退出编辑模式。若远端文件在编辑期间被其他进程修改，sshai 会停止自动回传并拒绝覆盖。该模式适合 GUI 查看/编辑程序（例如 `code`）；终端型编辑器需要自身独占终端，不建议与远端 Shell 同时使用。
 
 会话内执行 `sshai --agent codex` 或 `sshai --agent claude` 会把终端临时交给对应的本机 AI CLI。本机启动 `sshai` 时的目录是可读写的 local 工作区，远端 Shell 的当前目录是 primary remote 工作区；AI CLI 退出后回到原远端 Shell。Agent 的 MCP workspace 通过带随机令牌的本机 loopback bridge 复用当前已经认证的 SSH transport，并在其上新开 worker/SFTP channel，不会再次登录远端。可用 `sshai --agent codex --local-dir '/本机/其他目录'` 覆盖 local 目录；请引用路径，避免先被远端 Shell 展开。
