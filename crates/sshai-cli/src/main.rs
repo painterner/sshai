@@ -8,6 +8,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use anyhow::{Context, Result};
@@ -16,9 +17,10 @@ use serde_json::{Map, Value};
 use sshai_ai::{AgentSession, AgentUi, OpenAiProvider};
 use sshai_core::Target;
 use sshai_ssh::{
-    ConnectOptions, HostKeyPolicy, KeyInstallResult, MAX_WORKSPACE_READ, SessionCommandHandler,
-    SessionCommandResult, SessionInputResult, SshConnector, WorkspaceClient, WorkspaceMetadata,
-    WorkspaceStreamExecOptions, discover_public_identities,
+    Action, Conflict, ConflictPolicy, ConflictReason, ConnectOptions, CycleReport, HostKeyPolicy,
+    KeyInstallResult, MAX_WORKSPACE_READ, SessionCommandHandler, SessionCommandResult,
+    SessionInputResult, Side, SshConnector, SyncOptions, SyncSession, VCS_IGNORES, WorkspaceClient,
+    WorkspaceMetadata, WorkspaceStreamExecOptions, discover_public_identities, state_file_name,
 };
 use tokio::{
     fs,
@@ -152,6 +154,50 @@ enum Command {
         operation: SftpOperation,
     },
 
+    /// Keep a local and a remote directory synchronized in both directions.
+    Sync {
+        /// `host`, `user@host:port`, or `ssh://user@host:port`.
+        target: Target,
+
+        /// Local directory. Created when missing.
+        local: PathBuf,
+
+        /// Remote directory. Created when missing.
+        remote: String,
+
+        /// Synchronize once and exit instead of watching for changes.
+        #[arg(long)]
+        once: bool,
+
+        /// Seconds to wait between cycles.
+        #[arg(long, value_name = "SECONDS", default_value_t = 5)]
+        interval: u64,
+
+        /// Skip a file/directory name, or a relative subtree. Repeatable.
+        #[arg(long = "ignore", value_name = "PATTERN")]
+        ignores: Vec<String>,
+
+        /// Also skip version-control directories (.git, .hg, .svn, .bzr, .jj).
+        #[arg(long)]
+        ignore_vcs: bool,
+
+        /// What to do when both sides changed the same path.
+        #[arg(long, value_enum, default_value_t = SyncConflict::Safe)]
+        conflict: SyncConflict,
+
+        /// Never propagate a deletion to the other side.
+        #[arg(long)]
+        no_delete: bool,
+
+        /// Report what would change without touching either side.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Where to remember the last synchronized state.
+        #[arg(long, value_name = "PATH")]
+        state: Option<PathBuf>,
+    },
+
     /// Inspect files rooted in, or execute commands from, the remote workspace.
     Workspace {
         /// `host`, `user@host:port`, or `ssh://user@host:port/path`.
@@ -229,6 +275,30 @@ enum Command {
         #[arg(long)]
         config_only: bool,
     },
+}
+
+/// How `sshai sync` settles a path both sides changed.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum SyncConflict {
+    /// Report the conflict and change neither side.
+    Safe,
+    /// The local side wins.
+    Local,
+    /// The remote side wins.
+    Remote,
+    /// The more recently modified side wins.
+    Newest,
+}
+
+impl From<SyncConflict> for ConflictPolicy {
+    fn from(value: SyncConflict) -> Self {
+        match value {
+            SyncConflict::Safe => Self::Safe,
+            SyncConflict::Local => Self::Local,
+            SyncConflict::Remote => Self::Remote,
+            SyncConflict::Newest => Self::Newest,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -444,17 +514,11 @@ async fn run(cli: Cli) -> Result<u8> {
             flags: launch_flags,
             file_edit: None,
         };
-        let exit = if targets.len() > 1 {
-            connector
-                .interactive_shell_multiplexed(session, targets, &mut handler)
-                .await?
-        } else {
-            let exit = session
-                .interactive_shell_with_agent_handler(&mut handler)
-                .await?;
-            session.disconnect().await?;
-            exit
-        };
+        // Single-host sessions also run through the multiplexer: it owns the
+        // local shell pane and disconnects the sessions it opened.
+        let exit = connector
+            .interactive_shell_multiplexed(session, targets, &mut handler)
+            .await?;
         return Ok(exit_code(exit.code, exit.signal.as_deref()));
     }
 
@@ -498,6 +562,40 @@ async fn run(cli: Cli) -> Result<u8> {
                 bytes.bytes, bytes.files, bytes.directories
             );
             Ok(0)
+        }
+        Command::Sync {
+            target,
+            local,
+            remote,
+            once,
+            interval,
+            ignores,
+            ignore_vcs,
+            conflict,
+            no_delete,
+            dry_run,
+            state,
+        } => {
+            let mut ignores = ignores;
+            if ignore_vcs {
+                ignores.extend(VCS_IGNORES.iter().map(|pattern| (*pattern).to_owned()));
+            }
+            run_sync(
+                &connector,
+                target,
+                &launch_directory.join(local),
+                &remote,
+                SyncFlags {
+                    once,
+                    interval: Duration::from_secs(interval.max(1)),
+                    ignores,
+                    policy: conflict.into(),
+                    propagate_deletes: !no_delete,
+                    dry_run,
+                    state,
+                },
+            )
+            .await
         }
         Command::Workspace { target, operation } => {
             let session = connector.connect(&target).await?;
@@ -1797,6 +1895,205 @@ fn process_exit_code(status: std::process::ExitStatus) -> u8 {
         .code()
         .map(|code| u8::try_from(code.clamp(0, 255)).unwrap_or(255))
         .unwrap_or(128)
+}
+
+struct SyncFlags {
+    once: bool,
+    interval: Duration,
+    ignores: Vec<String>,
+    policy: ConflictPolicy,
+    propagate_deletes: bool,
+    dry_run: bool,
+    state: Option<PathBuf>,
+}
+
+async fn run_sync(
+    connector: &SshConnector,
+    target: Target,
+    local: &Path,
+    remote: &str,
+    flags: SyncFlags,
+) -> Result<u8> {
+    // The remote worker is rooted at the synchronized directory, so every
+    // remote path it sees stays inside it.
+    let mut rooted = target.clone();
+    rooted.path = Some(remote.to_owned());
+    let endpoint = format!(
+        "{}{}",
+        rooted
+            .user
+            .as_deref()
+            .map(|user| format!("{user}@"))
+            .unwrap_or_default(),
+        rooted
+            .port
+            .map(|port| format!("{}:{port}", rooted.host))
+            .unwrap_or_else(|| rooted.host.clone()),
+    );
+    let state_path = match flags.state.clone() {
+        Some(path) => path,
+        None => default_sync_state_path(local, &endpoint, remote)?,
+    };
+    let session = Arc::new(connector.connect(&rooted).await?);
+    let result = async {
+        let mut sync = SyncSession::open(
+            &session,
+            local,
+            remote,
+            SyncOptions {
+                ignores: flags.ignores.clone(),
+                policy: flags.policy,
+                propagate_deletes: flags.propagate_deletes,
+                dry_run: flags.dry_run,
+                state_path: state_path.clone(),
+            },
+        )
+        .await?;
+        let first_run = !sync.has_ancestor();
+        eprintln!(
+            "sshai sync: {} <-> {endpoint}:{}",
+            sync.local_root().display(),
+            sync.remote_root(),
+        );
+        eprintln!(
+            "  state {}{}{}",
+            sync.state_path().display(),
+            if first_run {
+                "; first run, so nothing is deleted"
+            } else {
+                ""
+            },
+            if flags.dry_run { "; dry run" } else { "" },
+        );
+
+        let mut exit = 0_u8;
+        let mut cycle = 0_u64;
+        loop {
+            cycle += 1;
+            let report = sync.cycle().await?;
+            if cycle == 1 || !report.is_quiet() {
+                print_sync_report(&report);
+            }
+            if !report.conflicts.is_empty() || !report.failures.is_empty() {
+                exit = 1;
+            }
+            if flags.once || flags.dry_run {
+                break;
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(flags.interval) => {}
+                result = tokio::signal::ctrl_c() => {
+                    result.map_err(anyhow::Error::from)?;
+                    eprintln!("sshai sync: stopped");
+                    exit = 0;
+                    break;
+                }
+            }
+        }
+        sync.close().await?;
+        Ok::<u8, anyhow::Error>(exit)
+    }
+    .await;
+    let disconnect = session.disconnect().await;
+    let exit = result?;
+    disconnect?;
+    Ok(exit)
+}
+
+fn default_sync_state_path(local: &Path, endpoint: &str, remote: &str) -> Result<PathBuf> {
+    let base = dirs::state_dir()
+        .or_else(dirs::data_local_dir)
+        .context("cannot determine a local state directory; pass --state")?;
+    let canonical = local.canonicalize().unwrap_or_else(|_| local.to_path_buf());
+    Ok(base
+        .join("sshai")
+        .join("sync")
+        .join(state_file_name(&canonical, endpoint, remote)))
+}
+
+fn print_sync_report(report: &CycleReport) {
+    for action in &report.applied {
+        let (marker, label, path) = match action {
+            Action::CopyFile { to, path } => (arrow(*to), "", path),
+            Action::CreateDirectory { side, path } => (arrow(*side), "mkdir ", path),
+            Action::Delete { side, path, .. } => (arrow(*side), "delete ", path),
+        };
+        println!("  {marker} {label}{path}");
+    }
+    for (action, error) in &report.failures {
+        println!("  ! {} failed: {error}", action.path());
+    }
+    for conflict in &report.conflicts {
+        println!("  x {} ({})", conflict.path, conflict_reason(conflict));
+    }
+    for (side, path) in &report.withheld_deletes {
+        println!(
+            "  - {path} was deleted on the other side; kept on {} (--no-delete)",
+            side.name()
+        );
+    }
+    let verb = if report.dry_run {
+        "would change"
+    } else {
+        "applied"
+    };
+    eprintln!(
+        "  {} local / {} remote entries, {} unchanged, hashed {}/{}, {verb} {}{}{}{} in {:.1}s",
+        report.local_entries,
+        report.remote_entries,
+        report.unchanged,
+        report.hashed_local,
+        report.hashed_remote,
+        report.applied.len(),
+        if report.conflicts.is_empty() {
+            String::new()
+        } else {
+            format!(", {} conflicts", report.conflicts.len())
+        },
+        if report.failures.is_empty() {
+            String::new()
+        } else {
+            format!(", {} failed", report.failures.len())
+        },
+        if report.skipped_symlinks == 0 {
+            String::new()
+        } else {
+            format!(", skipped {} symlinks", report.skipped_symlinks)
+        },
+        report.duration.as_secs_f64(),
+    );
+}
+
+/// Which way an action moves, from the local side's point of view.
+fn arrow(side: Side) -> &'static str {
+    match side {
+        Side::Local => "<-",
+        Side::Remote => "->",
+    }
+}
+
+fn conflict_reason(conflict: &Conflict) -> String {
+    match conflict.reason {
+        ConflictReason::BothChanged => "both sides changed".to_owned(),
+        ConflictReason::DeletedAndChanged { deleted } => {
+            format!(
+                "deleted on {}, changed on {}",
+                deleted.name(),
+                deleted.other().name()
+            )
+        }
+        ConflictReason::KindMismatch => "a file on one side, a directory on the other".to_owned(),
+        ConflictReason::DirectoryHasChanges { deleted } => format!(
+            "deleted on {}, but still holds content on {}",
+            deleted.name(),
+            deleted.other().name()
+        ),
+        ConflictReason::DirectoryHoldsIgnored { deleted } => format!(
+            "deleted on {}, but still holds ignored content on {}",
+            deleted.name(),
+            deleted.other().name()
+        ),
+    }
 }
 
 async fn run_session_mcp_proxy(address: SocketAddr, token: &str) -> Result<()> {

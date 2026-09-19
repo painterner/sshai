@@ -220,10 +220,7 @@ mod unix {
         if options.argv.is_empty() {
             bail!("missing sshai command; try `sshai help`");
         }
-        let long_running = options
-            .argv
-            .first()
-            .is_some_and(|command| matches!(command.as_str(), "codex" | "claude"));
+        let long_running = is_long_running(&options.argv);
         let cwd = std::env::current_dir()
             .context("cannot determine the remote working directory")?
             .to_string_lossy()
@@ -293,10 +290,7 @@ mod unix {
         if request.argv.is_empty() {
             return write_shim_error(&mut stream, "missing sshai command".to_owned()).await;
         }
-        let long_running = request
-            .argv
-            .first()
-            .is_some_and(|command| matches!(command.as_str(), "codex" | "claude"));
+        let long_running = is_long_running(&request.argv);
 
         let id = request_ids.fetch_add(1, Ordering::Relaxed);
         let (response_tx, response_rx) = oneshot::channel();
@@ -473,6 +467,17 @@ export PATH={quoted_bin}:$PATH\n"
         let permissions = std::fs::Permissions::from_mode(mode);
         tokio::fs::set_permissions(path, permissions).await?;
         Ok(())
+    }
+
+    /// Commands whose reply may take arbitrarily long: interactive AI sessions
+    /// and file transfers, which run for as long as the data takes.
+    fn is_long_running(argv: &[String]) -> bool {
+        argv.first().is_some_and(|command| {
+            matches!(
+                command.as_str(),
+                "codex" | "claude" | "--agent" | "get" | "put"
+            )
+        })
     }
 
     fn validate_session_id(value: &str) -> Result<()> {

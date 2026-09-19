@@ -8,6 +8,7 @@ use russh_sftp::{
     protocol::{FileAttributes, OpenFlags},
 };
 use sha2::{Digest, Sha256};
+use sshai_protocol::WorkspaceFileKind;
 use tokio::{
     fs::{self, OpenOptions},
     io::{AsyncReadExt, AsyncWriteExt, copy},
@@ -23,6 +24,16 @@ const MAX_TRANSFER_ENTRIES: u64 = 100_000;
 pub enum KeyInstallResult {
     Installed,
     AlreadyPresent,
+}
+
+/// One entry of a remote directory listing.
+#[derive(Clone, Debug)]
+pub struct RemoteDirEntry {
+    pub name: String,
+    pub kind: WorkspaceFileKind,
+    pub size: u64,
+    pub modified_ms: Option<u64>,
+    pub executable: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -56,6 +67,49 @@ impl SftpClient {
             .inner
             .try_exists(self.remote_path(remote.into()))
             .await?)
+    }
+
+    /// Whether the remote path is a directory, following the final symlink.
+    /// A path that does not exist is reported as `false`.
+    pub async fn is_dir(&self, remote: impl Into<String>) -> Result<bool> {
+        let remote = self.remote_path(remote.into());
+        if !self.inner.try_exists(remote.clone()).await? {
+            return Ok(false);
+        }
+        Ok(self.inner.metadata(remote).await?.is_dir())
+    }
+
+    /// One directory listing with the metadata the protocol already carries,
+    /// so a scan needs no extra round trip per entry.
+    pub async fn read_dir_entries(&self, remote: impl Into<String>) -> Result<Vec<RemoteDirEntry>> {
+        let remote = self.remote_path(remote.into());
+        let mut entries = Vec::new();
+        for entry in self.inner.read_dir(remote).await? {
+            let metadata = entry.metadata();
+            let kind = if metadata.is_symlink() {
+                WorkspaceFileKind::Symlink
+            } else if metadata.is_dir() {
+                WorkspaceFileKind::Directory
+            } else if metadata.is_regular() {
+                WorkspaceFileKind::File
+            } else {
+                WorkspaceFileKind::Other
+            };
+            entries.push(RemoteDirEntry {
+                name: entry.file_name(),
+                kind,
+                size: metadata.size.unwrap_or_default(),
+                // SFTP reports whole seconds.
+                modified_ms: metadata.mtime.map(|seconds| u64::from(seconds) * 1000),
+                executable: metadata.permissions.is_some_and(|mode| mode & 0o111 != 0),
+            });
+        }
+        Ok(entries)
+    }
+
+    /// Create the parent directories of a remote path.
+    pub async fn ensure_parent_dir(&self, remote: &str) -> Result<()> {
+        self.ensure_parent_directory(remote).await
     }
 
     pub async fn set_permissions(&self, remote: impl Into<String>, mode: u32) -> Result<()> {

@@ -111,14 +111,20 @@ struct ProgressiveShellState {
 }
 
 const TERMINAL_SCROLLBACK_ROWS: usize = 10_000;
-const MULTIPLEX_SWITCH_HINT: &str = "\x1b[1;36m[sshai] Shift+Left/Right switches hosts\x1b[0m\r\n";
+const MULTIPLEX_SWITCH_HINT: &str =
+    "\x1b[1;36m[sshai] Shift+Left/Right switches hosts · Ctrl+Left local\x1b[0m\r\n";
 const SWITCH_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(30);
 const SWITCH_PREFIX_TIMEOUT: Duration = Duration::from_secs(3);
 const SWITCH_PREVIOUS: &[u8] = b"\x1b[1;6D";
 const SWITCH_NEXT: &[u8] = b"\x1b[1;6C";
 const SWITCH_PREVIOUS_SHIFT_LEFT: &[u8] = b"\x1b[1;2D";
 const SWITCH_NEXT_SHIFT_RIGHT: &[u8] = b"\x1b[1;2C";
+// Ctrl+Left always selects the local pane. Ctrl+Right returns to the next
+// remote pane when the local pane is active, and otherwise advances hosts.
+const SWITCH_LOCAL_CTRL_LEFT: &[u8] = b"\x1b[1;5D";
+const SWITCH_NEXT_CTRL_RIGHT: &[u8] = b"\x1b[1;5C";
 const SWITCH_PREFIX: u8 = 0x1d; // Ctrl+]
+const LOCAL_PANE_LABEL: &str = "local";
 const PASSTHROUGH_TOGGLE: u8 = 0x1c; // Ctrl+\\
 
 enum MultiplexCommand {
@@ -142,6 +148,9 @@ enum MultiplexEvent {
         index: usize,
         data: Vec<u8>,
     },
+    LocalOutput {
+        data: Vec<u8>,
+    },
     ControlRequest {
         index: usize,
         request: ControlRequest,
@@ -155,6 +164,9 @@ enum MultiplexEvent {
         code: Option<u32>,
         signal: Option<String>,
     },
+    LocalExited {
+        code: Option<u32>,
+    },
 }
 
 struct MultiplexedShell {
@@ -164,6 +176,13 @@ struct MultiplexedShell {
     session: Arc<SshSession>,
     commands: mpsc::Sender<MultiplexCommand>,
     start: Option<oneshot::Sender<()>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    terminal: VirtualTerminal,
+    open: bool,
+}
+
+struct LocalShell {
+    commands: mpsc::Sender<MultiplexCommand>,
     task: Option<tokio::task::JoinHandle<()>>,
     terminal: VirtualTerminal,
     open: bool,
@@ -271,6 +290,31 @@ fn local_memory_bytes() -> u64 {
 enum InputAction {
     Previous,
     Next,
+    Local,
+}
+
+/// Switchable panes, ordered with the local shell first so that it matches the
+/// numbering of `sshai hosts` and stays reachable from a single-host session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Pane {
+    Local,
+    Remote(usize),
+}
+
+impl Pane {
+    fn position(self) -> usize {
+        match self {
+            Self::Local => 0,
+            Self::Remote(index) => index + 1,
+        }
+    }
+
+    fn at(position: usize) -> Self {
+        match position {
+            0 => Self::Local,
+            position => Self::Remote(position - 1),
+        }
+    }
 }
 
 const PREFIX_SWITCH_PREVIOUS: &[&[u8]] = &[b"\x1dh", b"\x1d[", b"\x1d\x1b[D", b"\x1d\x1bOD"];
@@ -310,31 +354,11 @@ impl SwitchInputParser {
                 index += 1;
                 continue;
             }
-            let matched = if remaining.starts_with(SWITCH_PREVIOUS) {
-                Some((SWITCH_PREVIOUS.len(), InputAction::Previous))
-            } else if remaining.starts_with(SWITCH_NEXT) {
-                Some((SWITCH_NEXT.len(), InputAction::Next))
-            } else if remaining.starts_with(SWITCH_PREVIOUS_SHIFT_LEFT) {
-                Some((SWITCH_PREVIOUS_SHIFT_LEFT.len(), InputAction::Previous))
-            } else if remaining.starts_with(SWITCH_NEXT_SHIFT_RIGHT) {
-                Some((SWITCH_NEXT_SHIFT_RIGHT.len(), InputAction::Next))
-            } else {
-                PREFIX_SWITCH_PREVIOUS
-                    .iter()
-                    .find(|sequence| remaining.starts_with(sequence))
-                    .map(|sequence| (sequence.len(), InputAction::Previous))
-                    .or_else(|| {
-                        PREFIX_SWITCH_NEXT
-                            .iter()
-                            .find(|sequence| remaining.starts_with(sequence))
-                            .map(|sequence| (sequence.len(), InputAction::Next))
-                    })
-            };
-            if let Some((length, action)) = matched {
+            if let Some((length, switch)) = matched_switch(remaining) {
                 if !data.is_empty() {
                     parsed.push(ParsedInput::Data(std::mem::take(&mut data)));
                 }
-                parsed.push(ParsedInput::Switch(action));
+                parsed.push(switch);
                 index += length;
                 continue;
             }
@@ -373,9 +397,44 @@ impl SwitchInputParser {
     }
 }
 
+fn matched_switch(remaining: &[u8]) -> Option<(usize, ParsedInput)> {
+    // Ctrl+Left selects the local pane; Ctrl+Right advances to the next remote.
+    const SINGLE_CHORDS: &[(&[u8], InputAction)] = &[
+        (SWITCH_PREVIOUS, InputAction::Previous),
+        (SWITCH_NEXT, InputAction::Next),
+        (SWITCH_NEXT_CTRL_RIGHT, InputAction::Next),
+        (SWITCH_PREVIOUS_SHIFT_LEFT, InputAction::Previous),
+        (SWITCH_NEXT_SHIFT_RIGHT, InputAction::Next),
+    ];
+    SINGLE_CHORDS
+        .iter()
+        .find(|(sequence, _)| remaining.starts_with(sequence))
+        .map(|(sequence, action)| (sequence.len(), ParsedInput::Switch(*action)))
+        .or_else(|| {
+            PREFIX_SWITCH_PREVIOUS
+                .iter()
+                .find(|sequence| remaining.starts_with(sequence))
+                .map(|sequence| (sequence.len(), ParsedInput::Switch(InputAction::Previous)))
+        })
+        .or_else(|| {
+            PREFIX_SWITCH_NEXT
+                .iter()
+                .find(|sequence| remaining.starts_with(sequence))
+                .map(|sequence| (sequence.len(), ParsedInput::Switch(InputAction::Next)))
+        })
+        .or_else(|| {
+            remaining.starts_with(SWITCH_LOCAL_CTRL_LEFT).then_some((
+                SWITCH_LOCAL_CTRL_LEFT.len(),
+                ParsedInput::Switch(InputAction::Local),
+            ))
+        })
+}
+
 fn switch_sequence_starts_with(bytes: &[u8]) -> bool {
     SWITCH_PREVIOUS.starts_with(bytes)
         || SWITCH_NEXT.starts_with(bytes)
+        || SWITCH_NEXT_CTRL_RIGHT.starts_with(bytes)
+        || SWITCH_LOCAL_CTRL_LEFT.starts_with(bytes)
         || SWITCH_PREVIOUS_SHIFT_LEFT.starts_with(bytes)
         || SWITCH_NEXT_SHIFT_RIGHT.starts_with(bytes)
         || LITERAL_SWITCH_PREFIX.starts_with(bytes)
@@ -606,17 +665,18 @@ impl SshConnector {
         })
     }
 
-    /// Run one persistent PTY per target while keeping the first target usable
-    /// before background connections to the remaining targets complete.
+    /// Run one persistent PTY per target, plus a local shell pane, while keeping
+    /// the first target usable before background connections to the remaining
+    /// targets complete. A single target is valid: it still gets the local pane.
     pub async fn interactive_shell_multiplexed(
         &self,
         primary: Arc<SshSession>,
         targets: Vec<Target>,
         handler: &mut dyn SessionCommandHandler,
     ) -> Result<CommandExit> {
-        if targets.len() < 2 {
+        if targets.is_empty() {
             return Err(SshError::Config(
-                "multiplexed SSH requires at least two targets".to_owned(),
+                "multiplexed SSH requires at least one target".to_owned(),
             ));
         }
         let mut background_connector = self.clone();
@@ -715,11 +775,17 @@ impl SshSession {
     }
 
     pub async fn sftp(&self) -> Result<SftpClient> {
+        self.sftp_at_root(self.target.path.as_deref()).await
+    }
+
+    /// An SFTP client whose relative paths resolve under `root`; `None` leaves
+    /// them to the server's default, so callers can pass absolute paths.
+    pub(crate) async fn sftp_at_root(&self, root: Option<&str>) -> Result<SftpClient> {
         let channel = self.session.channel_open_session().await?;
         channel.request_subsystem(true, "sftp").await?;
         let session = russh_sftp::client::SftpSession::new(channel.into_stream()).await?;
         session.set_timeout(self.target.connect_timeout.as_secs().max(60));
-        let base = match self.target.path.as_deref() {
+        let base = match root {
             Some("~") | None => None,
             Some(path) => Some(session.canonicalize(path).await?),
         };
@@ -1034,14 +1100,18 @@ impl SshSession {
         let files = session_support_files(session_dir, remote_worker, session_id);
         let bin_dir = join_remote_path(session_dir, "bin");
         let zsh_dir = join_remote_path(session_dir, "zsh");
+        let fish_completions =
+            join_remote_path(&join_remote_path(session_dir, "fish"), "completions");
         let mut command = format!(
-            "set -e; umask 077; mkdir -p {} {} {}; chmod 700 {} {} {};",
+            "set -e; umask 077; mkdir -p {} {} {} {}; chmod 700 {} {} {} {};",
             shell_quote(session_dir),
             shell_quote(&bin_dir),
             shell_quote(&zsh_dir),
+            shell_quote(&fish_completions),
             shell_quote(session_dir),
             shell_quote(&bin_dir),
             shell_quote(&zsh_dir),
+            shell_quote(&fish_completions),
         );
         for (path, contents, mode) in files {
             command.push_str(&format!(
@@ -1435,7 +1505,7 @@ impl SshSession {
                                     stdout.flush().await?;
                                 }
                                 ParsedInput::Switch(_) => unreachable!(
-                                    "single-host input parser does not parse host switches"
+                                    "single-host input parser does not parse pane switches"
                                 ),
                             }
                         }
@@ -1594,11 +1664,29 @@ impl SshSession {
         let id = request.id;
         let result = match request.argv.first().map(String::as_str) {
             Some("copy-id") => self.control_copy_id(&request.argv[1..]).await,
+            Some("get") => {
+                self.control_transfer(
+                    TransferDirection::Get,
+                    &request.argv[1..],
+                    request.cwd.as_deref(),
+                )
+                .await
+            }
+            Some("put") => {
+                self.control_transfer(
+                    TransferDirection::Put,
+                    &request.argv[1..],
+                    request.cwd.as_deref(),
+                )
+                .await
+            }
             Some("info" | "hosts") => Ok(format!(
                 "connected to {}@{}:{}\n",
                 self.target.user, self.target.host, self.target.port
             )),
             Some("help") | Some("--help") | Some("-h") => Ok(control_help().to_owned()),
+            // Hidden helper behind the remote shell's completion for `put`.
+            Some("--complete-local") => control_complete_local(&request.argv[1..]),
             Some(command) => Err(SshError::Agent(format!(
                 "unknown session command {command:?}; use `sshai --agent {command}` for a local AI CLI, or try `sshai help`"
             ))),
@@ -1667,6 +1755,93 @@ impl SshSession {
         }
     }
 
+    /// Transfer a file or directory over the session's own SSH connection, so
+    /// that `get`/`put` inside the remote shell need no second authentication.
+    async fn control_transfer(
+        &self,
+        direction: TransferDirection,
+        arguments: &[String],
+        remote_cwd: Option<&str>,
+    ) -> Result<String> {
+        if matches!(arguments, [argument] if argument == "-h" || argument == "--help") {
+            return Ok(direction.usage().to_owned());
+        }
+        let parsed = parse_transfer_arguments(direction, arguments)?;
+        let (remote_argument, local_argument) = match direction {
+            TransferDirection::Get => (&parsed.source, &parsed.destination),
+            TransferDirection::Put => (&parsed.destination, &parsed.source),
+        };
+        let mut local = expand_local_home(local_argument)?;
+        if local.is_relative() {
+            local = env::current_dir().map_err(SshError::Io)?.join(local);
+        }
+        let mut local = clean_local_path(local);
+        let sftp = self.sftp().await?;
+        let operation = async {
+            let home = sftp.remote_home().await?;
+            let mut remote = resolve_remote_transfer_path(remote_cwd, &home, remote_argument);
+            let stats = match direction {
+                TransferDirection::Get => {
+                    if !sftp.exists(remote.clone()).await? {
+                        return Err(SshError::Config(format!(
+                            "remote path {remote} does not exist"
+                        )));
+                    }
+                    // An existing directory destination keeps the source name, like scp.
+                    if local.is_dir() {
+                        local = local.join(remote_transfer_name(&remote)?);
+                    }
+                    sftp.download_path(
+                        remote.clone(),
+                        &local,
+                        parsed.recursive,
+                        parsed.force,
+                        &parsed.excludes,
+                    )
+                    .await?
+                }
+                TransferDirection::Put => {
+                    if !local.exists() {
+                        return Err(SshError::Config(format!(
+                            "local path {} does not exist",
+                            local.display()
+                        )));
+                    }
+                    if sftp.is_dir(remote.clone()).await? {
+                        remote = join_remote_path(&remote, &local_transfer_name(&local)?);
+                    }
+                    sftp.upload_path(
+                        &local,
+                        remote.clone(),
+                        parsed.recursive,
+                        parsed.force,
+                        &parsed.excludes,
+                    )
+                    .await?
+                }
+            };
+            let local = local.display().to_string();
+            let (from, to) = match direction {
+                TransferDirection::Get => (remote, local),
+                TransferDirection::Put => (local, remote),
+            };
+            Ok::<_, SshError>(format!(
+                "{} {from} -> {to}\ntransferred {} bytes in {} files and {} directories\n",
+                direction.name(),
+                stats.bytes,
+                stats.files,
+                stats.directories,
+            ))
+        }
+        .await;
+        let close = sftp.close().await;
+        match (operation, close) {
+            (Ok(output), Ok(())) => Ok(output),
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
     pub async fn disconnect(&self) -> Result<()> {
         self.session
             .disconnect(Disconnect::ByApplication, "sshai session closed", "en")
@@ -1688,6 +1863,7 @@ async fn run_multiplexed_shells(
     }
 
     let total = targets.len();
+    let panes = total + 1;
     let labels = targets.iter().map(ToString::to_string).collect::<Vec<_>>();
     let local_summary = local_connection_summary();
     let (events_tx, mut events_rx) = mpsc::channel(256);
@@ -1707,7 +1883,7 @@ async fn run_multiplexed_shells(
     let mut resize = ResizeEvents::new()?;
     let mut stdin_closed = false;
     let mut passthrough = false;
-    let mut active = Some(0_usize);
+    let mut active = Some(Pane::Remote(0));
     let mut pending_connections = total - 1;
     let mut statuses = vec!["connecting".to_owned(); total];
     statuses[0] = "connected".to_owned();
@@ -1725,7 +1901,26 @@ async fn run_multiplexed_shells(
     start_multiplexed_shell(shells[0].as_mut().expect("primary shell exists"));
     present_initial_multiplexed_shell(&mut stdout, &initial_display).await?;
 
-    let mut connection_tasks = Vec::with_capacity(total - 1);
+    // The local shell runs as its own pane from the start so Ctrl+Left always
+    // has somewhere to go, single-host sessions included. If it exits while
+    // inactive, its pane can still be restarted on a later Ctrl+Left.
+    let local_events = events_tx.clone();
+    let mut local_available = true;
+    let mut local = match prepare_local_shell(local_events.clone()).await {
+        Ok(mut shell) => {
+            shell.terminal.process(
+                connection_overview(&local_summary, &shells, &labels, &statuses, true).as_bytes(),
+            );
+            Some(shell)
+        }
+        Err(error) => {
+            tracing::debug!(%error, "local shell pane is unavailable");
+            local_available = false;
+            None
+        }
+    };
+
+    let mut connection_tasks = Vec::with_capacity(total.saturating_sub(1));
     for (index, target) in targets.into_iter().enumerate().skip(1) {
         let connector = background_connector.clone();
         let events = events_tx.clone();
@@ -1765,6 +1960,9 @@ async fn run_multiplexed_shells(
                     for shell in shells.iter().flatten().filter(|shell| shell.open) {
                         let _ = shell.commands.send(MultiplexCommand::Eof).await;
                     }
+                    if let Some(shell) = local.as_ref().filter(|shell| shell.open) {
+                        let _ = shell.commands.send(MultiplexCommand::Eof).await;
+                    }
                 } else {
                     for parsed in parser.feed(&input[..read], !passthrough) {
                         match parsed {
@@ -1779,18 +1977,15 @@ async fn run_multiplexed_shells(
                                 };
                                 if let Some(notice) = notice {
                                     let notice = format!("\r\nsshai: {notice}\r\n").into_bytes();
-                                    if let Some(active_index) = active {
-                                        if let Some(shell) = shells
-                                            .get_mut(active_index)
-                                            .and_then(Option::as_mut)
-                                        {
-                                            shell.terminal.process(&notice);
-                                        }
+                                    if let Some(terminal) =
+                                        pane_terminal_mut(&mut shells, local.as_mut(), active)
+                                    {
+                                        terminal.process(&notice);
                                     }
                                     stdout.write_all(&notice).await?;
                                     stdout.flush().await?;
                                 }
-                                if let Some(commands) = active_shell_commands(&shells, active) {
+                                if let Some(commands) = pane_commands(&shells, local.as_ref(), active) {
                                     if !data.is_empty() {
                                         let _ = commands.send(MultiplexCommand::Input(data)).await;
                                     }
@@ -1798,7 +1993,7 @@ async fn run_multiplexed_shells(
                             }
                             ParsedInput::TogglePassthrough => {
                                 passthrough = !passthrough;
-                                if let Some(commands) = active_shell_commands(&shells, active) {
+                                if let Some(commands) = pane_commands(&shells, local.as_ref(), active) {
                                     let _ = commands
                                         .send(MultiplexCommand::Input(passthrough_export(passthrough)))
                                         .await;
@@ -1808,37 +2003,81 @@ async fn run_multiplexed_shells(
                                     if passthrough { "remote passthrough" } else { "smart" }
                                 )
                                 .into_bytes();
-                                if let Some(active_index) = active {
-                                    if let Some(shell) = shells
-                                        .get_mut(active_index)
-                                        .and_then(Option::as_mut)
-                                    {
-                                        shell.terminal.process(&notice);
-                                    }
+                                if let Some(terminal) =
+                                    pane_terminal_mut(&mut shells, local.as_mut(), active)
+                                {
+                                    terminal.process(&notice);
                                 }
                                 stdout.write_all(&notice).await?;
                                 stdout.flush().await?;
                             }
                             ParsedInput::Switch(action) => {
-                                if let Some(current) = active {
-                                    if let Some(next) = adjacent_open_shell(&shells, current, action) {
+                                let next = if action == InputAction::Local {
+                                    Some(Pane::Local)
+                                } else {
+                                    active.and_then(|current| {
+                                        adjacent_switchable_pane(
+                                            &shells,
+                                            local.as_ref(),
+                                            local_available,
+                                            current,
+                                            action,
+                                        )
+                                    })
+                                };
+                                if let Some(next) = next {
+                                        // An inactive local pane keeps its ring slot;
+                                        // selecting it again can restart the shell.
+                                        if next == Pane::Local
+                                            && !local.as_ref().is_some_and(|shell| shell.open)
+                                        {
+                                            match prepare_local_shell(local_events.clone()).await {
+                                                Ok(mut shell) => {
+                                                    shell.terminal.process(
+                                                        connection_overview(
+                                                            &local_summary,
+                                                            &shells,
+                                                            &labels,
+                                                            &statuses,
+                                                            true,
+                                                        )
+                                                        .as_bytes(),
+                                                    );
+                                                    local = Some(shell);
+                                                }
+                                                Err(error) => {
+                                                    local_available = false;
+                                                    let notice = format!(
+                                                        "\r\n\x1b[1;31m[sshai] cannot start the local shell: {error}\x1b[0m\r\n"
+                                                    )
+                                                    .into_bytes();
+                                                    if let Some(terminal) =
+                                                        pane_terminal_mut(&mut shells, local.as_mut(), active)
+                                                    {
+                                                        terminal.process(&notice);
+                                                    }
+                                                    stdout.write_all(&notice).await?;
+                                                    stdout.flush().await?;
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                         active = Some(next);
-                                        if passthrough {
-                                            if let Some(commands) = active_shell_commands(&shells, active) {
+                                        if passthrough && matches!(next, Pane::Remote(_)) {
+                                            if let Some(commands) = pane_commands(&shells, local.as_ref(), active) {
                                                 let _ = commands
                                                     .send(MultiplexCommand::Input(passthrough_export(true)))
                                                     .await;
                                             }
                                         }
-                                        render_multiplexed_shell(&mut stdout, &shells[next], next, total).await?;
-                                    } else {
-                                        write_multiplexer_status(
-                                            &mut stdout,
-                                            pending_connections,
-                                            &statuses,
-                                        )
-                                        .await?;
-                                    }
+                                        render_pane(&mut stdout, &shells, local.as_ref(), next, panes).await?;
+                                } else {
+                                    write_multiplexer_status(
+                                        &mut stdout,
+                                        pending_connections,
+                                        &statuses,
+                                    )
+                                    .await?;
                                 }
                             }
                         }
@@ -1863,6 +2102,17 @@ async fn run_multiplexed_shells(
                             shell.terminal.process(overview.as_bytes());
                             start_multiplexed_shell(shell);
                         }
+                        if pending_connections == 0 {
+                            broadcast_pane_notice(
+                                &mut stdout,
+                                &mut shells,
+                                local.as_mut(),
+                                active,
+                                Some(Pane::Remote(index)),
+                                settled_overview(&overview).as_bytes(),
+                            )
+                            .await?;
+                        }
                         if passthrough {
                             if let Some(shell) = shells[index].as_ref() {
                                 let _ = shell
@@ -1872,13 +2122,38 @@ async fn run_multiplexed_shells(
                             }
                         }
                         if active.is_none() {
-                            active = Some(index);
-                            render_multiplexed_shell(&mut stdout, &shells[index], index, total).await?;
+                            active = Some(Pane::Remote(index));
+                            render_pane(
+                                &mut stdout,
+                                &shells,
+                                local.as_ref(),
+                                Pane::Remote(index),
+                                panes,
+                            )
+                            .await?;
                         }
                     }
                     MultiplexEvent::Failed { index, error } => {
                         pending_connections = pending_connections.saturating_sub(1);
                         statuses[index] = format!("failed: {error}");
+                        if pending_connections == 0 {
+                            let overview = connection_overview(
+                                &local_summary,
+                                &shells,
+                                &labels,
+                                &statuses,
+                                true,
+                            );
+                            broadcast_pane_notice(
+                                &mut stdout,
+                                &mut shells,
+                                local.as_mut(),
+                                active,
+                                None,
+                                settled_overview(&overview).as_bytes(),
+                            )
+                            .await?;
+                        }
                         if active.is_none() && pending_connections == 0 {
                             break 'multiplexer;
                         }
@@ -1886,7 +2161,16 @@ async fn run_multiplexed_shells(
                     MultiplexEvent::Output { index, data } => {
                         if let Some(shell) = shells.get_mut(index).and_then(Option::as_mut) {
                             shell.terminal.process(&data);
-                            if active == Some(index) {
+                            if active == Some(Pane::Remote(index)) {
+                                stdout.write_all(&data).await?;
+                                stdout.flush().await?;
+                            }
+                        }
+                    }
+                    MultiplexEvent::LocalOutput { data } => {
+                        if let Some(shell) = local.as_mut() {
+                            shell.terminal.process(&data);
+                            if active == Some(Pane::Local) {
                                 stdout.write_all(&data).await?;
                                 stdout.flush().await?;
                             }
@@ -1896,7 +2180,7 @@ async fn run_multiplexed_shells(
                         let notice = format!("\r\nsshai: {message}\r\n").into_bytes();
                         if let Some(shell) = shells.get_mut(index).and_then(Option::as_mut) {
                             shell.terminal.process(&notice);
-                            if active == Some(index) {
+                            if active == Some(Pane::Remote(index)) {
                                 stdout.write_all(&notice).await?;
                                 stdout.flush().await?;
                             }
@@ -1955,7 +2239,15 @@ async fn run_multiplexed_shells(
                                 stderr: result.stderr,
                             }
                         } else {
-                            session.handle_control_request(request).await
+                            // Built-in commands can transfer whole directories, so
+                            // they answer from a task instead of stalling the panes.
+                            tokio::spawn(async move {
+                                let response = session.handle_control_request(request).await;
+                                let _ = commands
+                                    .send(MultiplexCommand::ControlResponse(response))
+                                    .await;
+                            });
+                            continue;
                         };
                         let _ = commands
                             .send(MultiplexCommand::ControlResponse(response))
@@ -1977,23 +2269,53 @@ async fn run_multiplexed_shells(
                         if active_shell_exited_normally {
                             break 'multiplexer;
                         }
-                        if active == Some(index) {
-                            active = adjacent_open_shell(&shells, index, InputAction::Next);
+                        broadcast_pane_notice(
+                            &mut stdout,
+                            &mut shells,
+                            local.as_mut(),
+                            active,
+                            Some(Pane::Remote(index)),
+                            &pane_status_notice(31, &labels[index], "closed", pending_connections),
+                        )
+                        .await?;
+                        if active == Some(Pane::Remote(index)) {
+                            active = adjacent_open_pane(
+                                &shells,
+                                local.as_ref(),
+                                Pane::Remote(index),
+                                InputAction::Next,
+                            );
                             if let Some(next) = active {
-                                if passthrough {
-                                    if let Some(commands) = active_shell_commands(&shells, active) {
+                                if passthrough && matches!(next, Pane::Remote(_)) {
+                                    if let Some(commands) = pane_commands(&shells, local.as_ref(), active) {
                                         let _ = commands
                                             .send(MultiplexCommand::Input(passthrough_export(true)))
                                             .await;
                                     }
                                 }
-                                render_multiplexed_shell(&mut stdout, &shells[next], next, total).await?;
+                                render_pane(&mut stdout, &shells, local.as_ref(), next, panes).await?;
                             } else if pending_connections > 0 {
                                 stdout
                                     .write_all(b"\r\n\x1b[1;33m[sshai] waiting for background hosts...\x1b[0m\r\n")
                                     .await?;
                                 stdout.flush().await?;
                             }
+                        }
+                        if active.is_none() && pending_connections == 0 {
+                            break 'multiplexer;
+                        }
+                    }
+                    MultiplexEvent::LocalExited { code } => {
+                        if let Some(shell) = local.as_mut() {
+                            shell.open = false;
+                        }
+                        if active == Some(Pane::Local) {
+                            // `exit` in any active pane terminates the whole sshai
+                            // session. Do not fall back to a remote pane here:
+                            // that would require a second `exit` and would make
+                            // local behave differently from remote hosts.
+                            last_code = code.or(last_code);
+                            break 'multiplexer;
                         }
                         if active.is_none() && pending_connections == 0 {
                             break 'multiplexer;
@@ -2008,10 +2330,15 @@ async fn run_multiplexed_shells(
                     let commands = shell.commands.clone();
                     let _ = commands.send(MultiplexCommand::Resize(columns, rows)).await;
                 }
+                if let Some(shell) = local.as_mut().filter(|shell| shell.open) {
+                    shell.terminal.resize(columns, rows);
+                    let commands = shell.commands.clone();
+                    let _ = commands.send(MultiplexCommand::Resize(columns, rows)).await;
+                }
             }
             _ = &mut pending_timeout, if parser.has_pending() => {
                 if let Some(data) = parser.flush() {
-                    if let Some(commands) = active_shell_commands(&shells, active) {
+                    if let Some(commands) = pane_commands(&shells, local.as_ref(), active) {
                         let _ = commands.send(MultiplexCommand::Input(data)).await;
                     }
                 }
@@ -2024,8 +2351,14 @@ async fn run_multiplexed_shells(
     for task in &connection_tasks {
         task.abort();
     }
+    if let Some(shell) = local.as_ref().filter(|shell| shell.open) {
+        let _ = shell.commands.send(MultiplexCommand::Shutdown).await;
+    }
     for shell in shells.iter().flatten().filter(|shell| shell.open) {
         let _ = shell.commands.send(MultiplexCommand::Shutdown).await;
+    }
+    if let Some(task) = local.as_mut().and_then(|shell| shell.task.take()) {
+        let _ = task.await;
     }
     for shell in shells.iter_mut().flatten() {
         if let Some(task) = shell.task.take() {
@@ -2040,6 +2373,224 @@ async fn run_multiplexed_shells(
         code: last_code,
         signal: last_signal,
     })
+}
+
+/// Start the local shell pane on its own PTY. The pane is a plain login shell:
+/// remote worker features such as `sshai --agent` stay with the SSH panes.
+#[cfg(unix)]
+async fn prepare_local_shell(events: mpsc::Sender<MultiplexEvent>) -> Result<LocalShell> {
+    use std::{fs::File, process::Stdio};
+
+    use nix::pty::{Winsize, openpty};
+
+    let (columns, rows) = terminal_size();
+    let window = Winsize {
+        ws_row: terminal_dimension(rows),
+        ws_col: terminal_dimension(columns),
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    let pair = openpty(Some(&window), None).map_err(std::io::Error::from)?;
+    set_local_pty_nonblocking(&pair.master)?;
+    let master = tokio::io::unix::AsyncFd::new(pair.master)?;
+    let slave = File::from(pair.slave);
+    let child_stdin = slave.try_clone()?;
+    let child_stdout = slave.try_clone()?;
+    let child_stderr = slave;
+    let shell = env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned());
+    let mut command = tokio::process::Command::new(&shell);
+    command
+        .arg("-l")
+        .env(
+            "TERM",
+            env::var("TERM").unwrap_or_else(|_| "xterm-256color".to_owned()),
+        )
+        .env("COLUMNS", columns.to_string())
+        .env("LINES", rows.to_string())
+        .env("SSHAI_LOCAL_PANE", "1")
+        .stdin(Stdio::from(child_stdin))
+        .stdout(Stdio::from(child_stdout))
+        .stderr(Stdio::from(child_stderr))
+        .kill_on_drop(true);
+    // SAFETY: only async-signal-safe libc calls run between fork and exec.
+    unsafe {
+        command.pre_exec(|| {
+            if nix::libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if nix::libc::ioctl(0, nix::libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let process_group = nix::libc::getpgrp();
+            if nix::libc::ioctl(0, nix::libc::TIOCSPGRP, &process_group) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn()?;
+    let (commands, command_rx) = mpsc::channel(64);
+    let task = tokio::spawn(run_local_shell_actor(master, child, command_rx, events));
+    Ok(LocalShell {
+        commands,
+        task: Some(task),
+        terminal: VirtualTerminal::new(columns, rows),
+        open: true,
+    })
+}
+
+#[cfg(not(unix))]
+async fn prepare_local_shell(_events: mpsc::Sender<MultiplexEvent>) -> Result<LocalShell> {
+    Err(SshError::Config(
+        "the local shell pane is not implemented on this platform".to_owned(),
+    ))
+}
+
+#[cfg(unix)]
+async fn run_local_shell_actor(
+    master: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    mut child: tokio::process::Child,
+    mut commands: mpsc::Receiver<MultiplexCommand>,
+    events: mpsc::Sender<MultiplexEvent>,
+) {
+    let mut buffer = [0_u8; 8192];
+    let mut pty_open = true;
+    let mut closing = false;
+    let code = loop {
+        tokio::select! {
+            status = child.wait() => {
+                break status
+                    .ok()
+                    .and_then(|status| status.code())
+                    .map(|code| code.clamp(0, i32::MAX) as u32);
+            }
+            command = commands.recv(), if !closing => {
+                match command {
+                    Some(MultiplexCommand::Input(data)) => {
+                        if write_local_pty(&master, &data).await.is_err() {
+                            pty_open = false;
+                        }
+                    }
+                    Some(MultiplexCommand::Eof) => {
+                        let _ = write_local_pty(&master, &[0x04]).await;
+                    }
+                    Some(MultiplexCommand::Resize(columns, rows)) => {
+                        let _ = resize_local_pty(&master, columns, rows);
+                    }
+                    // The local pane runs no sshai worker, so it never answers
+                    // control requests.
+                    Some(MultiplexCommand::ControlResponse(_)) => {}
+                    Some(MultiplexCommand::Shutdown) | None => {
+                        closing = true;
+                        let _ = child.start_kill();
+                    }
+                }
+            }
+            read = read_local_pty(&master, &mut buffer), if pty_open => {
+                match read {
+                    Ok(0) => pty_open = false,
+                    Ok(count) => {
+                        if events
+                            .send(MultiplexEvent::LocalOutput { data: buffer[..count].to_vec() })
+                            .await
+                            .is_err()
+                        {
+                            closing = true;
+                            let _ = child.start_kill();
+                        }
+                    }
+                    Err(_) => pty_open = false,
+                }
+            }
+        }
+    };
+    let _ = events.send(MultiplexEvent::LocalExited { code }).await;
+}
+
+#[cfg(unix)]
+async fn read_local_pty(
+    master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    buffer: &mut [u8],
+) -> std::io::Result<usize> {
+    loop {
+        let mut readiness = master.readable().await?;
+        let result = readiness.try_io(|inner| {
+            nix::unistd::read(inner.get_ref(), buffer).map_err(std::io::Error::from)
+        });
+        match result {
+            Ok(Ok(read)) => return Ok(read),
+            // A closed shell reports EIO on the master side.
+            Ok(Err(error)) if error.raw_os_error() == Some(nix::libc::EIO) => return Ok(0),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => continue,
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn write_local_pty(
+    master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    data: &[u8],
+) -> std::io::Result<()> {
+    let mut written = 0;
+    while written < data.len() {
+        let mut readiness = master.writable().await?;
+        let result = readiness.try_io(|inner| {
+            nix::unistd::write(inner.get_ref(), &data[written..]).map_err(std::io::Error::from)
+        });
+        match result {
+            Ok(Ok(0)) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Ok(Ok(count)) => written += count,
+            Ok(Err(error)) => return Err(error),
+            Err(_) => continue,
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn resize_local_pty(
+    master: &tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
+    columns: u32,
+    rows: u32,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let window = nix::pty::Winsize {
+        ws_row: terminal_dimension(rows),
+        ws_col: terminal_dimension(columns),
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCSWINSZ reads the provided winsize and retains no pointer.
+    if unsafe { nix::libc::ioctl(master.get_ref().as_raw_fd(), nix::libc::TIOCSWINSZ, &window) } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_local_pty_nonblocking(fd: &std::os::fd::OwnedFd) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    // SAFETY: fcntl only reads flags from the owned descriptor.
+    let flags = unsafe { nix::libc::fcntl(fd.as_raw_fd(), nix::libc::F_GETFL) };
+    if flags < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFL updates only descriptor flags on the same descriptor.
+    if unsafe {
+        nix::libc::fcntl(
+            fd.as_raw_fd(),
+            nix::libc::F_SETFL,
+            flags | nix::libc::O_NONBLOCK,
+        )
+    } < 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 async fn prepare_multiplexed_shell(
@@ -2235,58 +2786,206 @@ fn start_multiplexed_shell(shell: &mut MultiplexedShell) {
     }
 }
 
-fn active_shell_commands(
+fn pane_is_open(
     shells: &[Option<MultiplexedShell>],
-    active: Option<usize>,
-) -> Option<mpsc::Sender<MultiplexCommand>> {
-    shells
-        .get(active?)?
-        .as_ref()
-        .filter(|shell| shell.open)
-        .map(|shell| shell.commands.clone())
+    local: Option<&LocalShell>,
+    pane: Pane,
+) -> bool {
+    match pane {
+        Pane::Local => local.is_some_and(|shell| shell.open),
+        Pane::Remote(index) => shells
+            .get(index)
+            .and_then(Option::as_ref)
+            .is_some_and(|shell| shell.open),
+    }
 }
 
-fn adjacent_open_shell(
+fn pane_commands(
     shells: &[Option<MultiplexedShell>],
-    current: usize,
+    local: Option<&LocalShell>,
+    pane: Option<Pane>,
+) -> Option<mpsc::Sender<MultiplexCommand>> {
+    match pane? {
+        Pane::Local => local
+            .filter(|shell| shell.open)
+            .map(|shell| shell.commands.clone()),
+        Pane::Remote(index) => shells
+            .get(index)?
+            .as_ref()
+            .filter(|shell| shell.open)
+            .map(|shell| shell.commands.clone()),
+    }
+}
+
+fn pane_terminal_mut<'a>(
+    shells: &'a mut [Option<MultiplexedShell>],
+    local: Option<&'a mut LocalShell>,
+    pane: Option<Pane>,
+) -> Option<&'a mut VirtualTerminal> {
+    match pane? {
+        Pane::Local => local.map(|shell| &mut shell.terminal),
+        Pane::Remote(index) => shells
+            .get_mut(index)?
+            .as_mut()
+            .map(|shell| &mut shell.terminal),
+    }
+}
+
+fn adjacent_pane(
+    panes: usize,
+    current: Pane,
     action: InputAction,
-) -> Option<usize> {
-    (1..shells.len())
+    accept: impl Fn(Pane) -> bool,
+) -> Option<Pane> {
+    let current = current.position();
+    (1..panes)
         .map(|distance| match action {
-            InputAction::Next => (current + distance) % shells.len(),
-            InputAction::Previous => (current + shells.len() - distance) % shells.len(),
+            InputAction::Next => (current + distance) % panes,
+            InputAction::Previous => (current + panes - distance) % panes,
+            InputAction::Local => current,
         })
-        .find(|index| shells[*index].as_ref().is_some_and(|shell| shell.open))
+        .map(Pane::at)
+        .find(|pane| accept(*pane))
+}
+
+fn adjacent_open_pane(
+    shells: &[Option<MultiplexedShell>],
+    local: Option<&LocalShell>,
+    current: Pane,
+    action: InputAction,
+) -> Option<Pane> {
+    adjacent_pane(shells.len() + 1, current, action, |pane| {
+        pane_is_open(shells, local, pane)
+    })
+}
+
+/// The pane `Shift+Left/Right` moves to. A local shell that exited keeps its
+/// slot as long as local shells can run at all, so it can be restarted.
+fn adjacent_switchable_pane(
+    shells: &[Option<MultiplexedShell>],
+    local: Option<&LocalShell>,
+    local_available: bool,
+    current: Pane,
+    action: InputAction,
+) -> Option<Pane> {
+    adjacent_pane(shells.len() + 1, current, action, |pane| match pane {
+        Pane::Local => local_available,
+        Pane::Remote(_) => pane_is_open(shells, local, pane),
+    })
 }
 
 fn closes_multiplexer_on_exit(
-    active: Option<usize>,
+    active: Option<Pane>,
     exited: usize,
     code: Option<u32>,
     signal: Option<&str>,
 ) -> bool {
-    active == Some(exited) && (code.is_some() || signal.is_some())
+    active == Some(Pane::Remote(exited)) && (code.is_some() || signal.is_some())
 }
 
 fn passthrough_export(enabled: bool) -> Vec<u8> {
     format!("export SSHAI_PASSTHROUGH={}\n", if enabled { 1 } else { 0 }).into_bytes()
 }
 
-async fn render_multiplexed_shell(
+/// The connection list as panes that already saw the startup copy need it: on
+/// its own line, and without repeating the shortcut hint.
+fn settled_overview(overview: &str) -> String {
+    format!(
+        "\r\n{}",
+        overview
+            .strip_suffix(MULTIPLEX_SWITCH_HINT)
+            .unwrap_or(overview)
+    )
+}
+
+/// One line summarizing a host's new state, for panes that are showing an
+/// older copy of the connection list.
+fn pane_status_notice(color: u8, label: &str, status: &str, pending: usize) -> Vec<u8> {
+    let tail = if pending > 0 {
+        format!("; {pending} still connecting")
+    } else {
+        String::new()
+    };
+    format!(
+        "\r\n\x1b[{color}m[sshai] {} {}{tail}\x1b[0m\r\n",
+        display_label(label),
+        display_label(status),
+    )
+    .into_bytes()
+}
+
+/// Append a notice to every open pane except `skip`, and to the terminal when
+/// the pane in view is one of them.
+async fn broadcast_pane_notice(
     stdout: &mut tokio::io::Stdout,
-    shell: &Option<MultiplexedShell>,
-    index: usize,
-    total: usize,
+    shells: &mut [Option<MultiplexedShell>],
+    local: Option<&mut LocalShell>,
+    active: Option<Pane>,
+    skip: Option<Pane>,
+    notice: &[u8],
 ) -> Result<()> {
-    let shell = shell.as_ref().expect("rendered shell must exist");
-    let label = display_label(&shell.label);
-    let snapshot = shell.terminal.snapshot();
+    for (index, shell) in shells.iter_mut().enumerate() {
+        if skip == Some(Pane::Remote(index)) {
+            continue;
+        }
+        if let Some(shell) = shell.as_mut().filter(|shell| shell.open) {
+            shell.terminal.process(notice);
+        }
+    }
+    let mut local_commands = None;
+    if skip != Some(Pane::Local) {
+        if let Some(shell) = local.filter(|shell| shell.open) {
+            shell.terminal.process(notice);
+            local_commands = Some(shell.commands.clone());
+        }
+    }
+    let Some(active) = active.filter(|pane| Some(*pane) != skip) else {
+        return Ok(());
+    };
+    stdout.write_all(notice).await?;
+    stdout.flush().await?;
+    // The notice lands where the shell left its prompt, so ask that shell to
+    // repaint: readline and full-screen programs redraw on a window change.
+    let commands = match active {
+        Pane::Local => local_commands,
+        Pane::Remote(index) => shells
+            .get(index)
+            .and_then(Option::as_ref)
+            .filter(|shell| shell.open)
+            .map(|shell| shell.commands.clone()),
+    };
+    if let Some(commands) = commands {
+        let (columns, rows) = terminal_size();
+        let _ = commands.send(MultiplexCommand::Resize(columns, rows)).await;
+    }
+    Ok(())
+}
+
+async fn render_pane(
+    stdout: &mut tokio::io::Stdout,
+    shells: &[Option<MultiplexedShell>],
+    local: Option<&LocalShell>,
+    pane: Pane,
+    panes: usize,
+) -> Result<()> {
+    let (label, snapshot) = match pane {
+        Pane::Local => {
+            let shell = local.expect("rendered local shell must exist");
+            (LOCAL_PANE_LABEL.to_owned(), shell.terminal.snapshot())
+        }
+        Pane::Remote(index) => {
+            let shell = shells
+                .get(index)
+                .and_then(Option::as_ref)
+                .expect("rendered shell must exist");
+            (display_label(&shell.label), shell.terminal.snapshot())
+        }
+    };
     stdout
         .write_all(
             format!(
-                "\x1b]0;sshai [{}/{}] {label} — Shift+←/→\x07",
-                index + 1,
-                total
+                "\x1b]0;sshai [{}/{panes}] {label} — Shift+←/→ · Ctrl+← local\x07",
+                pane.position() + 1,
             )
             .as_bytes(),
         )
@@ -2313,8 +3012,8 @@ fn initial_multiplexer_display(
     statuses: &[String],
 ) -> Vec<u8> {
     format!(
-        "\x1b]0;sshai [1/{}] {} — Shift+←/→\x07{}",
-        labels.len(),
+        "\x1b]0;sshai [2/{}] {} — Shift+←/→ · Ctrl+← local\x07{}",
+        labels.len() + 1,
         display_label(label),
         connection_overview(local, shells, labels, statuses, true),
     )
@@ -2585,13 +3284,260 @@ fn random_session_id() -> Result<String> {
     ))
 }
 
-fn join_remote_path(parent: &str, child: &str) -> String {
+pub(crate) fn join_remote_path(parent: &str, child: &str) -> String {
     format!(
         "{}/{}",
         parent.trim_end_matches('/'),
         child.trim_start_matches('/')
     )
 }
+
+/// Bash completion for the session shim, also loaded by zsh through
+/// `bashcompinit`. `get` completes remote paths with the shell's own file
+/// completion; `put` asks the local client for candidates.
+const SESSION_BASH_COMPLETION: &str = r#"_sshai_session_words() {
+  _sshai_session_sub=""
+  _sshai_session_positional=0
+  local index=1 word expect=0
+  while [ "$index" -lt "$COMP_CWORD" ]; do
+    word=${COMP_WORDS[$index]}
+    index=$((index + 1))
+    if [ "$expect" = 1 ]; then expect=0; continue; fi
+    case "$word" in
+      --exclude) expect=1 ;;
+      --agent|--file)
+        if [ -z "$_sshai_session_sub" ]; then _sshai_session_sub=$word
+        else _sshai_session_positional=$((_sshai_session_positional + 1)); fi ;;
+      -*|"") ;;
+      *)
+        if [ -z "$_sshai_session_sub" ]; then _sshai_session_sub=$word
+        else _sshai_session_positional=$((_sshai_session_positional + 1)); fi ;;
+    esac
+  done
+}
+
+_sshai_session_complete() {
+  local cur side shim
+  local _sshai_session_sub _sshai_session_positional
+  cur=${COMP_WORDS[COMP_CWORD]}
+  COMPREPLY=()
+  _sshai_session_words
+  if [ -z "$_sshai_session_sub" ]; then
+    compopt +o filenames 2>/dev/null
+    COMPREPLY=($(compgen -W "get put copy-id info hosts help --agent --file" -- "$cur"))
+    return 0
+  fi
+  case "$cur" in
+    -*)
+      compopt +o filenames 2>/dev/null
+      case "$_sshai_session_sub" in
+        get|put) COMPREPLY=($(compgen -W "-r --recursive --exclude --force -h --help" -- "$cur")) ;;
+        copy-id) COMPREPLY=($(compgen -W "-i --identity= --authorized-keys" -- "$cur")) ;;
+        *) COMPREPLY=($(compgen -W "-h --help" -- "$cur")) ;;
+      esac
+      return 0
+      ;;
+  esac
+  side=remote
+  case "$_sshai_session_sub" in
+    get) if [ "$_sshai_session_positional" = 0 ]; then side=remote; else side=local; fi ;;
+    put) if [ "$_sshai_session_positional" = 0 ]; then side=local; else side=remote; fi ;;
+    copy-id) side=local ;;
+    --agent)
+      if [ "$_sshai_session_positional" = 0 ]; then side=agents; else side=none; fi ;;
+    --file)
+      if [ "$_sshai_session_positional" = 0 ]; then side=none; else side=remote; fi ;;
+    info|hosts|help) side=none ;;
+  esac
+  case "$side" in
+    local)
+      # Completion must never wait for a worker that is still starting.
+      if [ -n "$SSHAI_SESSION_SOCKET" ] && [ ! -S "$SSHAI_SESSION_SOCKET" ]; then
+        return 0
+      fi
+      shim=${SSHAI_SESSION_BIN:+$SSHAI_SESSION_BIN/}sshai
+      local IFS='
+'
+      COMPREPLY=($("$shim" --complete-local "$cur" 2>/dev/null))
+      ;;
+    remote)
+      local IFS='
+'
+      COMPREPLY=($(compgen -f -- "$cur"))
+      ;;
+    agents)
+      compopt +o filenames 2>/dev/null
+      COMPREPLY=($(compgen -W "codex claude gemini opencode kimi" -- "$cur"))
+      ;;
+    *) COMPREPLY=() ;;
+  esac
+  # Keep the cursor inside a directory candidate instead of adding a space.
+  # The loop avoids indexing, which differs between bash and zsh.
+  if [ ${#COMPREPLY[@]} -eq 1 ]; then
+    local only
+    for only in "${COMPREPLY[@]}"; do
+      case "$only" in
+        */) compopt -o nospace 2>/dev/null ;;
+      esac
+    done
+  fi
+  return 0
+}
+
+complete -o filenames -F _sshai_session_complete sshai
+"#;
+
+/// Native zsh completion: zsh's `bashcompinit` has no `compopt`, so a
+/// directory candidate needs `compadd -S ''` to keep the cursor inside it.
+const SESSION_ZSH_COMPLETION: &str = r#"_sshai_session_complete() {
+  local sub="" side="remote" current word shim
+  local -i index=2 expect=0 positional=0
+  local -a candidates directories plain
+  current=${words[CURRENT]}
+  while (( index < CURRENT )); do
+    word=${words[index]}
+    (( index++ ))
+    if (( expect )); then expect=0; continue; fi
+    case $word in
+      --exclude) expect=1 ;;
+      --agent|--file|-*|'')
+        case $word in
+          --agent|--file)
+            if [[ -z $sub ]]; then sub=$word; else (( positional++ )); fi ;;
+        esac ;;
+      *)
+        if [[ -z $sub ]]; then sub=$word; else (( positional++ )); fi ;;
+    esac
+  done
+  if [[ -z $sub ]]; then
+    compadd -- get put copy-id info hosts help --agent --file
+    return 0
+  fi
+  if [[ $current == -* ]]; then
+    case $sub in
+      get|put) compadd -- -r --recursive --exclude --force -h --help ;;
+      copy-id) compadd -- -i --identity= --authorized-keys ;;
+      *) compadd -- -h --help ;;
+    esac
+    return 0
+  fi
+  case $sub in
+    get) if (( positional == 0 )); then side=remote; else side=local; fi ;;
+    put) if (( positional == 0 )); then side=local; else side=remote; fi ;;
+    copy-id) side=local ;;
+    --agent) if (( positional == 0 )); then side=agents; else side=none; fi ;;
+    --file) if (( positional == 0 )); then side=none; else side=remote; fi ;;
+    info|hosts|help) side=none ;;
+  esac
+  case $side in
+    remote) _files ;;
+    local)
+      if [[ -n $SSHAI_SESSION_SOCKET && ! -S $SSHAI_SESSION_SOCKET ]]; then
+        return 0
+      fi
+      shim=sshai
+      [[ -n $SSHAI_SESSION_BIN ]] && shim=$SSHAI_SESSION_BIN/sshai
+      candidates=( ${(f)"$($shim --complete-local $current 2>/dev/null)"} )
+      directories=( ${(M)candidates:#*/} )
+      plain=( ${candidates:#*/} )
+      (( $#directories )) && compadd -S '' -- $directories
+      (( $#plain )) && compadd -- $plain
+      ;;
+    agents) compadd -- codex claude gemini opencode kimi ;;
+  esac
+  return 0
+}
+
+compdef _sshai_session_complete sshai
+"#;
+
+/// Fish completion for the session shim, loaded through `fish_complete_path`.
+const SESSION_FISH_COMPLETION: &str = r#"function __sshai_session_side --description 'which side sshai completes at the cursor'
+    set -l tokens (commandline -opc)
+    set -l sub ""
+    set -l positional 0
+    set -l expect 0
+    for token in $tokens[2..-1]
+        if test $expect -eq 1
+            set expect 0
+            continue
+        end
+        switch $token
+            case --exclude
+                set expect 1
+            case --agent --file
+                if test -z "$sub"
+                    set sub $token
+                else
+                    set positional (math $positional + 1)
+                end
+            case '-*'
+            case '*'
+                if test -z "$sub"
+                    set sub $token
+                else
+                    set positional (math $positional + 1)
+                end
+        end
+    end
+    if test -z "$sub"
+        echo subcommand
+        return 0
+    end
+    switch $sub
+        case get
+            if test $positional -eq 0
+                echo remote
+            else
+                echo local
+            end
+        case put
+            if test $positional -eq 0
+                echo local
+            else
+                echo remote
+            end
+        case copy-id
+            echo local
+        case --agent
+            if test $positional -eq 0
+                echo agents
+            else
+                echo none
+            end
+        case --file
+            if test $positional -eq 0
+                echo none
+            else
+                echo remote
+            end
+        case info hosts help
+            echo none
+        case '*'
+            echo remote
+    end
+end
+
+function __sshai_session_local --description 'local path candidates from the sshai client'
+    if set -q SSHAI_SESSION_SOCKET; and not test -S "$SSHAI_SESSION_SOCKET"
+        return 0
+    end
+    set -l shim sshai
+    if set -q SSHAI_SESSION_BIN
+        set shim $SSHAI_SESSION_BIN/sshai
+    end
+    $shim --complete-local (commandline -ct) 2>/dev/null
+end
+
+complete -c sshai -f
+complete -c sshai -n 'test (__sshai_session_side) = subcommand' -a 'get put copy-id info hosts help --agent --file'
+complete -c sshai -n 'test (__sshai_session_side) = agents' -a 'codex claude gemini opencode kimi'
+complete -c sshai -n 'test (__sshai_session_side) = local' -a '(__sshai_session_local)'
+complete -c sshai -n 'test (__sshai_session_side) = remote' -a '(__fish_complete_path (commandline -ct))'
+complete -c sshai -n 'contains -- (__sshai_session_side) local remote' -s r -l recursive -d 'Transfer a directory'
+complete -c sshai -n 'contains -- (__sshai_session_side) local remote' -l exclude -r -d 'Skip a name or relative subtree'
+complete -c sshai -n 'contains -- (__sshai_session_side) local remote' -l force -d 'Replace an existing destination'
+"#;
 
 fn session_support_files(
     session_dir: &str,
@@ -2606,6 +3552,9 @@ fn session_support_files(
     let launcher = join_remote_path(session_dir, "launch-shell");
     let bashrc = join_remote_path(session_dir, "bashrc");
     let shrc = join_remote_path(session_dir, "shrc");
+    let completion = join_remote_path(session_dir, "completion.sh");
+    let zsh_completion = join_remote_path(&zsh_dir, "completion.zsh");
+    let fish_completions = join_remote_path(&join_remote_path(session_dir, "fish"), "completions");
 
     let quoted_socket = shell_quote(&socket);
     let quoted_error = shell_quote(&error_file);
@@ -2628,10 +3577,13 @@ exec {} invoke --session-id {} --socket {quoted_socket} -- \"$@\"\n",
     let quoted_bashrc = shell_quote(&bashrc);
     let quoted_shrc = shell_quote(&shrc);
     let quoted_zsh_dir = shell_quote(&zsh_dir);
+    let quoted_completion = shell_quote(&completion);
     let fish_init = shell_quote(&format!(
-        "set -gx SSHAI_SESSION_BIN {}; set -gx PATH {} $PATH",
+        "set -gx SSHAI_SESSION_BIN {}; set -gx SSHAI_SESSION_SOCKET {}; set -gx PATH {} $PATH; set -g fish_complete_path {} $fish_complete_path",
         fish_quote(&bin_dir),
-        fish_quote(&bin_dir)
+        fish_quote(&socket),
+        fish_quote(&bin_dir),
+        fish_quote(&fish_completions),
     ));
     let launcher_body = format!(
         "#!/bin/sh\n\
@@ -2651,13 +3603,16 @@ elif [ -r \"$HOME/.bash_login\" ]; then . \"$HOME/.bash_login\"\n\
 elif [ -r \"$HOME/.profile\" ]; then . \"$HOME/.profile\"\n\
 fi\n\
 export PATH={quoted_bin}:\"$PATH\"\n\
-export SSHAI_SESSION_BIN={quoted_bin}\n"
+export SSHAI_SESSION_BIN={quoted_bin}\n\
+export SSHAI_SESSION_SOCKET={quoted_socket}\n\
+if [ -r {quoted_completion} ]; then . {quoted_completion}; fi\n"
     );
     let shrc_body = format!(
         "if [ -r /etc/profile ]; then . /etc/profile; fi\n\
 if [ -r \"$HOME/.profile\" ]; then . \"$HOME/.profile\"; fi\n\
 export PATH={quoted_bin}:\"$PATH\"\n\
-export SSHAI_SESSION_BIN={quoted_bin}\n"
+export SSHAI_SESSION_BIN={quoted_bin}\n\
+export SSHAI_SESSION_SOCKET={quoted_socket}\n"
     );
 
     let mut files = vec![
@@ -2665,16 +3620,43 @@ export SSHAI_SESSION_BIN={quoted_bin}\n"
         (launcher, launcher_body, 0o700),
         (bashrc, bashrc_body, 0o600),
         (shrc, shrc_body, 0o600),
+        (completion, SESSION_BASH_COMPLETION.to_owned(), 0o600),
+        (
+            zsh_completion.clone(),
+            SESSION_ZSH_COMPLETION.to_owned(),
+            0o600,
+        ),
+        (
+            join_remote_path(&fish_completions, "sshai.fish"),
+            SESSION_FISH_COMPLETION.to_owned(),
+            0o600,
+        ),
     ];
     for name in [".zshenv", ".zprofile", ".zshrc", ".zlogin", ".zlogout"] {
-        let body = format!(
+        let mut body = format!(
             "original=\"${{SSHAI_ORIGINAL_ZDOTDIR:-$HOME}}/{name}\"\n\
 if [[ -r \"$original\" ]]; then source \"$original\"; fi\n\
 unset original\n\
 export ZDOTDIR={quoted_zsh_dir}\n\
 export PATH={quoted_bin}:$PATH\n\
-export SSHAI_SESSION_BIN={quoted_bin}\n"
+export SSHAI_SESSION_BIN={quoted_bin}\n\
+export SSHAI_SESSION_SOCKET={quoted_socket}\n"
         );
+        // zsh reuses the bash function, but only once its own completion
+        // system is initialized by the user's startup files.
+        if name == ".zshrc" {
+            let dump = shell_quote(&join_remote_path(&zsh_dir, "zcompdump"));
+            let quoted_zsh_completion = shell_quote(&zsh_completion);
+            body.push_str(&format!(
+                "if ! whence -w compdef > /dev/null 2>&1; then\n\
+  autoload -Uz compinit && compinit -i -d {dump}\n\
+fi\n\
+if whence -w compdef > /dev/null 2>&1; then\n\
+  autoload -Uz _files > /dev/null 2>&1\n\
+  source {quoted_zsh_completion}\n\
+fi\n"
+            ));
+        }
         files.push((join_remote_path(&zsh_dir, name), body, 0o600));
     }
     for (name, arguments) in [
@@ -2714,18 +3696,246 @@ fn control_help() -> &'static str {
   sshai --agent NAME [-- AGENT_ARGUMENTS...]  (codex, claude, gemini, opencode, ...)\n\
   sshai --file PROGRAM REMOTE_FILE  (edit locally; Ctrl+Q exits and keeps syncing)\n\
   sshai copy-id [-i LOCAL_KEY] [--authorized-keys REMOTE_PATH]\n\
+  sshai get [-r] [--exclude PATTERN] [--force] REMOTE [LOCAL]\n\
+  sshai put [-r] [--exclude PATTERN] [--force] LOCAL [REMOTE]\n\
   sshai info\n\
   sshai hosts\n\
   sshai help\n\
 \n\
 Agent names after --agent are resolved on the local machine. Known agents use built-in adapters;\n\
 other executables must advertise MCP support and receive the generic MCP environment.\n\
+`get` and `put` transfer over this session, so they never authenticate again. Directories\n\
+need -r, --exclude is repeatable, and --force overwrites an existing destination. Remote paths\n\
+are relative to the current remote directory, local paths to the directory sshai started in.\n\
 These commands run through the encrypted session control channel. LOCAL_KEY is\n\
 read on your local machine; quote paths containing '~' to prevent the remote\n\
 shell from expanding them first, for example: sshai copy-id -i '~/.ssh/id_ed25519.pub'\n\
-In a multi-host session, use Shift+Left/Right to switch hosts. Ctrl+Shift+Left/Right and\n\
-Ctrl+] followed by Left/Right (or h/l) are also supported.\n\
+Shift+Left/Right switches hosts. Ctrl+Left always selects the local shell pane, in single-host\n\
+and multi-host sessions alike; Ctrl+Right returns to the next remote host.\n\
+Ctrl+Shift+Left/Right and Ctrl+] followed by Left/Right (or h/l) also switch panes.\n\
 Ctrl+\\\\ toggles smart command wrappers; passthrough mode uses the remote commands.\n"
+}
+
+const LOCAL_COMPLETION_LIMIT: usize = 500;
+
+fn control_complete_local(arguments: &[String]) -> Result<String> {
+    let prefix = arguments.first().map(String::as_str).unwrap_or_default();
+    let cwd = env::current_dir().map_err(SshError::Io)?;
+    let mut candidates = local_path_completions(prefix, &cwd)?;
+    if candidates.is_empty() {
+        return Ok(String::new());
+    }
+    candidates.push(String::new());
+    Ok(candidates.join("\n"))
+}
+
+/// Local path candidates for a prefix typed in the remote shell: the typed
+/// directory part is kept so the shell can insert a candidate verbatim, and
+/// directories keep a trailing `/` so completion can continue into them.
+fn local_path_completions(prefix: &str, cwd: &Path) -> Result<Vec<String>> {
+    let (typed_directory, partial) = match prefix.rfind('/') {
+        Some(index) => (&prefix[..=index], &prefix[index + 1..]),
+        None => ("", prefix),
+    };
+    let base = if typed_directory.is_empty() {
+        cwd.to_path_buf()
+    } else {
+        let expanded = expand_local_home(typed_directory)?;
+        if expanded.is_absolute() {
+            expanded
+        } else {
+            cwd.join(expanded)
+        }
+    };
+    let mut candidates = Vec::new();
+    // An unreadable directory simply has no candidates.
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return Ok(candidates);
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(partial) {
+            continue;
+        }
+        // Hidden entries appear once the leading dot has been typed.
+        if name.starts_with('.') && !partial.starts_with('.') {
+            continue;
+        }
+        let directory = entry
+            .file_type()
+            .map(|kind| kind.is_dir())
+            .unwrap_or_default()
+            || entry.path().is_dir();
+        let suffix = if directory { "/" } else { "" };
+        candidates.push(format!("{typed_directory}{name}{suffix}"));
+    }
+    candidates.sort();
+    candidates.truncate(LOCAL_COMPLETION_LIMIT);
+    Ok(candidates)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TransferDirection {
+    Get,
+    Put,
+}
+
+impl TransferDirection {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Get => "get",
+            Self::Put => "put",
+        }
+    }
+
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Get => "usage: sshai get [-r] [--exclude PATTERN] [--force] REMOTE [LOCAL]\n",
+            Self::Put => "usage: sshai put [-r] [--exclude PATTERN] [--force] LOCAL [REMOTE]\n",
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct TransferArguments {
+    source: String,
+    destination: String,
+    recursive: bool,
+    force: bool,
+    excludes: Vec<String>,
+}
+
+fn parse_transfer_arguments(
+    direction: TransferDirection,
+    arguments: &[String],
+) -> Result<TransferArguments> {
+    let mut recursive = false;
+    let mut force = false;
+    let mut excludes = Vec::new();
+    let mut positional = Vec::new();
+    let mut options_ended = false;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments[index].as_str();
+        if options_ended || !argument.starts_with('-') || argument == "-" {
+            positional.push(argument.to_owned());
+            index += 1;
+            continue;
+        }
+        match argument {
+            "--" => options_ended = true,
+            "-r" | "-R" | "--recursive" => recursive = true,
+            "-f" | "--force" => force = true,
+            "--exclude" => {
+                index += 1;
+                let pattern = arguments.get(index).ok_or_else(|| {
+                    SshError::Config(format!("--exclude needs a PATTERN; {}", direction.usage()))
+                })?;
+                excludes.push(pattern.clone());
+            }
+            value if value.starts_with("--exclude=") => {
+                excludes.push(value["--exclude=".len()..].to_owned());
+            }
+            value => {
+                return Err(SshError::Config(format!(
+                    "unknown option {value:?}; {}",
+                    direction.usage()
+                )));
+            }
+        }
+        index += 1;
+    }
+    let (source, destination) = match positional.as_slice() {
+        // A missing destination means "here", resolved against the current
+        // directory on the receiving side.
+        [source] => (source.clone(), ".".to_owned()),
+        [source, destination] => (source.clone(), destination.clone()),
+        _ => return Err(SshError::Config(direction.usage().trim_end().to_owned())),
+    };
+    if source.is_empty() || destination.is_empty() {
+        return Err(SshError::Config(format!(
+            "paths must not be empty; {}",
+            direction.usage()
+        )));
+    }
+    Ok(TransferArguments {
+        source,
+        destination,
+        recursive,
+        force,
+        excludes,
+    })
+}
+
+/// Resolve a remote transfer path to an absolute one: `~` against the remote
+/// home directory, anything else relative against the shell's current directory.
+fn resolve_remote_transfer_path(remote_cwd: Option<&str>, remote_home: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        let trimmed = path.trim_end_matches('/');
+        return if trimmed.is_empty() {
+            "/".to_owned()
+        } else {
+            trimmed.to_owned()
+        };
+    }
+    let (base, relative) = match path.strip_prefix('~') {
+        Some("") => (remote_home, ""),
+        Some(rest) if rest.starts_with('/') => (remote_home, rest.trim_start_matches('/')),
+        _ => {
+            let base = match remote_cwd {
+                Some(cwd) if !cwd.is_empty() && cwd != "." => cwd,
+                _ => remote_home,
+            };
+            (base, path)
+        }
+    };
+    let relative = relative
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .trim_start_matches('/');
+    if relative.is_empty() || relative == "." {
+        return base.trim_end_matches('/').to_owned();
+    }
+    join_remote_path(base, relative)
+}
+
+/// Drop `.` components so that a `.` destination reads as the directory itself.
+fn clean_local_path(path: PathBuf) -> PathBuf {
+    let cleaned = path
+        .components()
+        .filter(|component| !matches!(component, std::path::Component::CurDir))
+        .collect::<PathBuf>();
+    if cleaned.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        cleaned
+    }
+}
+
+fn remote_transfer_name(remote: &str) -> Result<String> {
+    remote
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty() && *name != "." && *name != "..")
+        .map(ToOwned::to_owned)
+        .ok_or_else(|| {
+            SshError::Config(format!(
+                "cannot take a file name from the remote path {remote:?}"
+            ))
+        })
+}
+
+fn local_transfer_name(local: &Path) -> Result<String> {
+    local
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| {
+            SshError::Config(format!(
+                "cannot take a file name from the local path {}",
+                local.display()
+            ))
+        })
 }
 
 fn parse_copy_id_arguments(arguments: &[String]) -> Result<(Option<PathBuf>, Option<String>)> {
@@ -3055,6 +4265,232 @@ mod tests {
     }
 
     #[test]
+    fn settled_overview_starts_a_line_and_drops_the_repeated_hint() {
+        let overview = format!(
+            "\x1b[1;36m[sshai connections]\r\n  1. local: /home\r\n{MULTIPLEX_SWITCH_HINT}"
+        );
+        let settled = settled_overview(&overview);
+        assert!(settled.starts_with("\r\n\x1b[1;36m[sshai connections]"));
+        assert!(settled.ends_with("  1. local: /home\r\n"));
+        assert!(!settled.contains("switches panes"));
+        // An overview without the hint is only moved onto its own line.
+        assert_eq!(
+            settled_overview("  2. host: ready\r\n"),
+            "\r\n  2. host: ready\r\n"
+        );
+    }
+
+    #[test]
+    fn host_status_notices_report_the_remaining_connections() {
+        let notice = pane_status_notice(32, "build\u{7}", "connected", 2);
+        let text = String::from_utf8(notice).unwrap();
+        assert_eq!(
+            text,
+            "\r\n\x1b[32m[sshai] build connected; 2 still connecting\x1b[0m\r\n"
+        );
+        let last = String::from_utf8(pane_status_notice(31, "test", "failed: timeout", 0)).unwrap();
+        assert_eq!(last, "\r\n\x1b[31m[sshai] test failed: timeout\x1b[0m\r\n");
+    }
+
+    #[test]
+    fn session_files_install_path_completion_for_every_shell() {
+        let files = session_support_files(
+            "/tmp/session",
+            "/tmp/cache/sshai-worker",
+            "0123456789abcdef0123456789abcdef",
+        );
+        let body = |suffix: &str| {
+            files
+                .iter()
+                .find(|(path, _, _)| path.ends_with(suffix))
+                .map(|(_, body, _)| body.clone())
+                .unwrap_or_else(|| panic!("missing session file {suffix}"))
+        };
+
+        let bash = body("/completion.sh");
+        assert!(bash.contains("complete -o filenames -F _sshai_session_complete sshai"));
+        // `put` asks the client for local candidates; `get` uses the remote shell.
+        assert!(bash.contains("--complete-local"));
+        assert!(bash.contains("compgen -f -- \"$cur\""));
+
+        let zsh = body("/zsh/completion.zsh");
+        assert!(zsh.contains("compdef _sshai_session_complete sshai"));
+        assert!(zsh.contains("compadd -S '' -- $directories"));
+
+        let fish = body("/fish/completions/sshai.fish");
+        assert!(fish.contains("complete -c sshai"));
+        assert!(fish.contains("__sshai_session_local"));
+
+        assert!(body("/bashrc").contains(". '/tmp/session/completion.sh'"));
+        assert!(body("/zsh/.zshrc").contains("source '/tmp/session/zsh/completion.zsh'"));
+        assert!(!body("/zsh/.zshenv").contains("completion.zsh"));
+        let launcher = body("/launch-shell");
+        assert!(launcher.contains("set -g fish_complete_path"));
+        assert!(launcher.contains("/tmp/session/fish/completions"));
+    }
+
+    #[test]
+    fn completes_local_paths_for_the_remote_shell() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path();
+        std::fs::create_dir(root.join("b_dir")).unwrap();
+        std::fs::write(root.join("b_dir/inner.txt"), b"x").unwrap();
+        std::fs::write(root.join("a.txt"), b"x").unwrap();
+        std::fs::write(root.join(".hidden"), b"x").unwrap();
+
+        // Directories keep a trailing slash so completion can descend.
+        assert_eq!(
+            local_path_completions("", root).unwrap(),
+            vec!["a.txt".to_owned(), "b_dir/".to_owned()]
+        );
+        // Hidden entries appear only once the dot is typed.
+        assert_eq!(
+            local_path_completions(".", root).unwrap(),
+            vec![".hidden".to_owned()]
+        );
+        assert_eq!(
+            local_path_completions("b", root).unwrap(),
+            vec!["b_dir/".to_owned()]
+        );
+        // The typed directory part comes back with the candidate.
+        assert_eq!(
+            local_path_completions("b_dir/", root).unwrap(),
+            vec!["b_dir/inner.txt".to_owned()]
+        );
+        assert_eq!(
+            local_path_completions("b_dir/i", root).unwrap(),
+            vec!["b_dir/inner.txt".to_owned()]
+        );
+        let absolute = format!("{}/a", root.display());
+        assert_eq!(
+            local_path_completions(&absolute, root).unwrap(),
+            vec![format!("{}/a.txt", root.display())]
+        );
+        assert!(local_path_completions("missing/", root).unwrap().is_empty());
+        assert!(local_path_completions("zz", root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn parses_session_transfer_arguments() {
+        let arguments = [
+            "-r",
+            "--exclude",
+            ".git",
+            "--exclude=target",
+            "-f",
+            "/srv/app",
+            "app",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let parsed = parse_transfer_arguments(TransferDirection::Get, &arguments).unwrap();
+        assert_eq!(
+            parsed,
+            TransferArguments {
+                source: "/srv/app".to_owned(),
+                destination: "app".to_owned(),
+                recursive: true,
+                force: true,
+                excludes: vec![".git".to_owned(), "target".to_owned()],
+            }
+        );
+
+        // A single path means "into the current directory on the other side".
+        let single =
+            parse_transfer_arguments(TransferDirection::Put, &["dist/app".to_owned()]).unwrap();
+        assert_eq!(single.destination, ".");
+        assert!(!single.recursive && !single.force);
+
+        // Paths after -- keep their leading dash.
+        let escaped = parse_transfer_arguments(
+            TransferDirection::Get,
+            &["--".to_owned(), "-weird-name".to_owned()],
+        )
+        .unwrap();
+        assert_eq!(escaped.source, "-weird-name");
+
+        assert!(
+            parse_transfer_arguments(TransferDirection::Get, &["--zip".to_owned()])
+                .unwrap_err()
+                .to_string()
+                .contains("unknown option")
+        );
+        assert!(
+            parse_transfer_arguments(TransferDirection::Get, &["--exclude".to_owned()]).is_err()
+        );
+        assert!(parse_transfer_arguments(TransferDirection::Get, &[]).is_err());
+        assert!(
+            parse_transfer_arguments(
+                TransferDirection::Get,
+                &["a".to_owned(), "b".to_owned(), "c".to_owned()]
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn resolves_session_transfer_remote_paths() {
+        let cwd = Some("/srv/app");
+        let home = "/home/deploy";
+        assert_eq!(
+            resolve_remote_transfer_path(cwd, home, "config.toml"),
+            "/srv/app/config.toml"
+        );
+        assert_eq!(
+            resolve_remote_transfer_path(cwd, home, "./logs/today.log"),
+            "/srv/app/logs/today.log"
+        );
+        assert_eq!(resolve_remote_transfer_path(cwd, home, "."), "/srv/app");
+        assert_eq!(
+            resolve_remote_transfer_path(cwd, home, "~/backup.tar"),
+            "/home/deploy/backup.tar"
+        );
+        assert_eq!(resolve_remote_transfer_path(cwd, home, "~"), "/home/deploy");
+        assert_eq!(
+            resolve_remote_transfer_path(cwd, home, "/etc/hosts"),
+            "/etc/hosts"
+        );
+        assert_eq!(
+            resolve_remote_transfer_path(cwd, home, "/var/log/"),
+            "/var/log"
+        );
+        assert_eq!(resolve_remote_transfer_path(cwd, home, "/"), "/");
+        // Without a reported shell directory, relative paths follow the remote home.
+        assert_eq!(
+            resolve_remote_transfer_path(None, home, "notes.md"),
+            "/home/deploy/notes.md"
+        );
+    }
+
+    #[test]
+    fn cleans_current_directory_components_from_local_paths() {
+        assert_eq!(
+            clean_local_path(PathBuf::from("/home/ka/./dist/./app")),
+            PathBuf::from("/home/ka/dist/app")
+        );
+        assert_eq!(
+            clean_local_path(PathBuf::from("/home/ka/.")),
+            PathBuf::from("/home/ka")
+        );
+        assert_eq!(clean_local_path(PathBuf::from(".")), PathBuf::from("."));
+    }
+
+    #[test]
+    fn derives_transfer_names_for_directory_destinations() {
+        assert_eq!(
+            remote_transfer_name("/srv/app/config.toml").unwrap(),
+            "config.toml"
+        );
+        assert_eq!(remote_transfer_name("/srv/app/").unwrap(), "app");
+        assert!(remote_transfer_name("/").is_err());
+        assert_eq!(
+            local_transfer_name(Path::new("/home/ka/dist/app")).unwrap(),
+            "app"
+        );
+        assert!(local_transfer_name(Path::new("/")).is_err());
+    }
+
+    #[test]
     fn parses_remote_copy_id_arguments_as_local_paths() {
         let (identity, authorized_keys) = parse_copy_id_arguments(&[
             "--identity=/tmp/local key.pub".to_owned(),
@@ -3208,9 +4644,169 @@ mod tests {
 
     #[test]
     fn normal_exit_of_active_host_closes_the_whole_multiplexer() {
-        assert!(closes_multiplexer_on_exit(Some(1), 1, Some(0), None));
-        assert!(closes_multiplexer_on_exit(Some(1), 1, None, Some("TERM")));
-        assert!(!closes_multiplexer_on_exit(Some(0), 1, Some(0), None));
-        assert!(!closes_multiplexer_on_exit(Some(1), 1, None, None));
+        assert!(closes_multiplexer_on_exit(
+            Some(Pane::Remote(1)),
+            1,
+            Some(0),
+            None
+        ));
+        assert!(closes_multiplexer_on_exit(
+            Some(Pane::Remote(1)),
+            1,
+            None,
+            Some("TERM")
+        ));
+        assert!(!closes_multiplexer_on_exit(
+            Some(Pane::Remote(0)),
+            1,
+            Some(0),
+            None
+        ));
+        assert!(!closes_multiplexer_on_exit(
+            Some(Pane::Remote(1)),
+            1,
+            None,
+            None
+        ));
+        // The remote-exit helper does not classify a local pane as remote.
+        assert!(!closes_multiplexer_on_exit(
+            Some(Pane::Local),
+            1,
+            Some(0),
+            None
+        ));
+    }
+
+    #[test]
+    fn ctrl_left_selects_local_and_ctrl_right_advances_remote() {
+        let mut parser = SwitchInputParser::default();
+        assert!(matches!(
+            parser.feed(b"\x1b[1;5D", true).as_slice(),
+            [ParsedInput::Switch(InputAction::Local)]
+        ));
+        assert!(matches!(
+            parser.feed(b"\x1b[1;5Cls", true).as_slice(),
+            [ParsedInput::Switch(InputAction::Next), ParsedInput::Data(data)] if data == b"ls"
+        ));
+        assert!(!parser.has_pending());
+    }
+
+    #[test]
+    fn pane_ring_starts_at_the_local_shell() {
+        assert_eq!(Pane::Local.position(), 0);
+        assert_eq!(Pane::Remote(0).position(), 1);
+        assert_eq!(Pane::at(0), Pane::Local);
+        assert_eq!(Pane::at(2), Pane::Remote(1));
+    }
+
+    #[test]
+    fn single_host_sessions_switch_between_the_host_and_the_local_shell() {
+        let shells = vec![None];
+        // Without a running local shell the ring has nowhere else to go.
+        assert_eq!(
+            adjacent_open_pane(&shells, None, Pane::Remote(0), InputAction::Previous),
+            None
+        );
+
+        let local = test_local_shell(true);
+        assert_eq!(
+            adjacent_open_pane(
+                &shells,
+                Some(&local),
+                Pane::Remote(0),
+                InputAction::Previous
+            ),
+            Some(Pane::Local)
+        );
+        assert_eq!(
+            adjacent_open_pane(&shells, Some(&local), Pane::Remote(0), InputAction::Next),
+            Some(Pane::Local)
+        );
+        assert_eq!(
+            adjacent_open_pane(&shells, Some(&local), Pane::Local, InputAction::Next),
+            None
+        );
+
+        let closed = test_local_shell(false);
+        assert_eq!(
+            adjacent_open_pane(
+                &shells,
+                Some(&closed),
+                Pane::Remote(0),
+                InputAction::Previous
+            ),
+            None
+        );
+        // Shift still reaches an exited local pane so that it can be restarted,
+        // unless local shells cannot run at all.
+        assert_eq!(
+            adjacent_switchable_pane(
+                &shells,
+                Some(&closed),
+                true,
+                Pane::Remote(0),
+                InputAction::Previous
+            ),
+            Some(Pane::Local)
+        );
+        assert_eq!(
+            adjacent_switchable_pane(
+                &shells,
+                Some(&closed),
+                false,
+                Pane::Remote(0),
+                InputAction::Previous
+            ),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn local_shell_pane_runs_input_and_reports_its_exit() {
+        let (events_tx, mut events_rx) = mpsc::channel(64);
+        let shell = prepare_local_shell(events_tx)
+            .await
+            .expect("local shell pane starts");
+        shell
+            .commands
+            .send(MultiplexCommand::Input(
+                b"printf sshai-local; exit 7\n".to_vec(),
+            ))
+            .await
+            .expect("local shell accepts input");
+
+        let mut output = Vec::new();
+        let mut code = None;
+        let collected = tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(event) = events_rx.recv().await {
+                match event {
+                    MultiplexEvent::LocalOutput { data } => output.extend_from_slice(&data),
+                    MultiplexEvent::LocalExited { code: exit } => {
+                        code = exit;
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+
+        assert!(collected.is_ok(), "local shell pane did not exit in time");
+        assert_eq!(code, Some(7));
+        assert!(
+            String::from_utf8_lossy(&output).contains("sshai-local"),
+            "missing local shell output: {}",
+            String::from_utf8_lossy(&output)
+        );
+    }
+
+    fn test_local_shell(open: bool) -> LocalShell {
+        LocalShell {
+            commands: mpsc::channel(1).0,
+            task: None,
+            terminal: VirtualTerminal::new(80, 24),
+            open,
+        }
     }
 }

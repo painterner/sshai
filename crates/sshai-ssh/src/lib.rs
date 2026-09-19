@@ -11,6 +11,7 @@ mod host_key;
 mod identity;
 mod session;
 mod sftp;
+mod sync;
 mod workspace;
 
 pub use config::{HostKeyPolicy, ResolvedTarget, SshConfig};
@@ -23,6 +24,10 @@ pub use session::{
 pub use sftp::{KeyInstallResult, SftpClient, SftpTransferStats};
 pub use sshai_protocol::{
     MAX_WORKSPACE_READ, WorkspaceEntry, WorkspaceFileKind, WorkspaceMetadata,
+};
+pub use sync::{
+    Action, Conflict, ConflictPolicy, ConflictReason, CycleReport, Side, SyncOptions, SyncSession,
+    VCS_IGNORES, state_file_name,
 };
 pub use workspace::{
     WorkspaceClient, WorkspaceExecResult, WorkspaceMutation, WorkspaceStreamExecOptions,

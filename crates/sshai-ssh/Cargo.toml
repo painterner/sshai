@@ -9,6 +9,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+blake3.workspace = true
 dirs.workspace = true
 hex.workspace = true
 nix.workspace = true
@@ -16,6 +17,8 @@ rpassword.workspace = true
 russh.workspace = true
 russh-sftp.workspace = true
 secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 sshai-core = { path = "../sshai-core" }
 sshai-protocol = { path = "../sshai-protocol" }

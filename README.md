@@ -67,11 +67,13 @@ Bare targets may use `host`, `user@host`, `host:port`, or `user@host:port`. Text
 
 With multiple hosts, sshai connects to the first host and opens its shell immediately without waiting for the others. On initial entry, it appends a one-line shortcut hint without clearing the terminal or its scrollback. Virtual-screen rendering takes over only after the first host switch. The remaining hosts connect in parallel in the background, including PTY and worker startup.
 
-Press `Shift+Left` or `Shift+Right` once to cycle through connected hosts. The older `Ctrl+Shift+Left` and `Ctrl+Shift+Right` shortcuts are still recognized, although Terminator uses them for pane resizing by default. As a fallback, press `Ctrl+]`, followed by `Left`, `Right`, `h`, or `l`. Pressing `Ctrl+]` twice sends a literal `Ctrl+]` to the remote host. Traditional terminals cannot reliably distinguish `Ctrl+Shift+[` or `Ctrl+Shift+]` from ordinary `Esc` or `Ctrl+]`, nor `Ctrl+Shift+J/L` from newline or clear-screen control characters, so sshai does not reserve those combinations.
+Every session also has a local shell pane, in single-host and multi-host sessions alike. It is the first pane. The local shell is a plain login shell on your own machine (it exports `SSHAI_LOCAL_PANE=1`), keeps its own screen and working directory like any host pane, and running `exit` there closes the entire sshai session just like `exit` on a remote host. `Ctrl+Left` always selects the local pane, while `Ctrl+Right` returns to the next remote host.
 
-Each host retains its own shell, current directory, foreground process, and VT100 screen state. Switching restores only that host's visible screen; it does not clear shared scrollback, replay old output, or continuously add scrollback lines. Running `exit` normally on the active host closes every host and returns to the local shell once. An unexpected disconnect without an exit status leaves the other live hosts available.
+Press `Shift+Left` or `Shift+Right` once to cycle through the connected remote hosts, in the order `sshai hosts` lists them. Use `Ctrl+Left` to jump directly to the local shell and `Ctrl+Right` to return to the next remote host. The older `Ctrl+Shift+Left` and `Ctrl+Shift+Right` shortcuts are still recognized, although Terminator uses them for pane resizing by default. As a fallback, press `Ctrl+]`, followed by `Left`, `Right`, `h`, or `l`. Pressing `Ctrl+]` twice sends a literal `Ctrl+]` to the remote host. Traditional terminals cannot reliably distinguish `Ctrl+Shift+[` or `Ctrl+Shift+]` from ordinary `Esc` or `Ctrl+]`, nor `Ctrl+Shift+J/L` from newline or clear-screen control characters, so sshai does not reserve those combinations.
 
-At session startup, sshai lists the local workspace and every target with its working directory, operating system, CPU architecture, and memory. A target still connecting in the background is marked `connecting`. Run `sshai hosts` or its alias `sshai info` at any time to see the latest state, including connected, failed, and closed targets:
+Each pane retains its own shell, current directory, foreground process, and VT100 screen state. Switching restores only that host's visible screen; it does not clear shared scrollback, replay old output, or continuously add scrollback lines. Running `exit` normally on the active host closes every host and returns to the local shell once. An unexpected disconnect without an exit status leaves the other live hosts available.
+
+At session startup, sshai lists the local workspace and every target with its working directory, operating system, CPU architecture, and memory. A target still connecting in the background is marked `connecting`. Once every background target has either connected or failed, sshai appends the finished list to every pane and lets that pane's shell repaint its prompt, so no pane is left showing `connecting` for a host that is long since up. Run `sshai hosts` or its alias `sshai info` at any time to see the latest state, including connected, failed, and closed targets:
 
 ```text
 sshai connections
@@ -104,7 +106,23 @@ sshai --agent opencode
 sshai --agent kimi
 sshai copy-id
 sshai copy-id -i '~/.ssh/id_ed25519.pub'
+sshai get /var/log/app.log
+sshai put ./artifact.tar.gz /tmp/
 ```
+
+`sshai get` and `sshai put` transfer files and directories over the session that is already open, so they never authenticate a second time:
+
+```bash
+sshai get app.log                                   # remote ./app.log -> the directory sshai was started in
+sshai get /etc/nginx/nginx.conf ./conf/nginx.conf
+sshai get -r /srv/app ./app --exclude .git --exclude target
+sshai put ./dist/app bin/app                        # local ./dist/app -> remote ./bin/app
+sshai put -r ./site /var/www/site --exclude node_modules --force
+```
+
+Tab completion follows the side each argument belongs to: `sshai put <TAB>` completes **local** paths (the remote shell asks the sshai client over the same session), `sshai get <TAB>` completes **remote** paths, and the destination argument completes the opposite side. Subcommands, options, and `--agent` names complete as well. This is installed for bash, zsh, and fish inside sshai's private session startup files only; nothing on the remote host is modified, and a POSIX `sh` session simply has no completion.
+
+Remote paths are relative to the remote shell's current directory (`~` is the remote home); local paths are relative to the directory local sshai was started in, which is the one `sshai hosts` lists as `1. local`. A destination that is an existing directory keeps the source name, like `scp`, and a missing destination means "the current directory on the receiving side". Directory transfers require `-r`, `--exclude` may be repeated, and an existing destination is only replaced with `--force`. In a multi-host session, each pane transfers over its own connection and its own current directory, and a running transfer does not block the other panes.
 
 In a normal worker-enabled session, common commands have a shorter smart form. Typing `codex`, `claude`, `gemini`, `opencode`, or `kimi` invokes the corresponding local AI CLI. Typing `code remote.txt` opens the remote file in local editing mode. These commands are wrapped only inside sshai's private session `PATH`; they do not modify the remote system. Press `Ctrl+\` to toggle passthrough mode, where the same names resolve to real remote executables. Press it again to restore smart mode.
 
@@ -249,7 +267,7 @@ sshai doctor dev-server
 sshai doctor dev-server --config-only
 ```
 
-Transfer files or directories through SFTP:
+Transfer files or directories through SFTP from outside a session (inside a session, use `sshai get` / `sshai put` shown above):
 
 ```bash
 sshai sftp dev-server put ./artifact.tar.gz /tmp/artifact.tar.gz
@@ -268,6 +286,32 @@ sshai sftp dev-server put -r ./project /srv/project \
 ```
 
 Directory sources require an explicit `-r` or `--recursive`. Existing files are not overwritten by default; `--force` permits per-file replacement. An `--exclude name` filter excludes matching names at any depth. A filter containing `/` matches a relative subtree within the source directory. Uploads and downloads reject symbolic links and special files and are limited to 100,000 filesystem entries per operation.
+
+Keep a local and a remote directory synchronized in both directions, in the shape of Mutagen's safe mode:
+
+```bash
+# Watch both sides and reconcile every 5 seconds
+sshai sync dev-server ./project /srv/project --ignore-vcs --ignore node_modules
+
+# One pass, useful in scripts and CI; exits 1 when anything conflicts or fails
+sshai sync dev-server ./project /srv/project --once
+
+# See what a pass would do without touching either side
+sshai sync dev-server ./project /srv/project --dry-run
+```
+
+Both directories are created when missing. Each pass scans both sides, compares them against the last state they agreed on, and only changes a side when the *other* side is the one that changed:
+
+- A path changed on one side propagates to the other. A path deleted on one side is deleted on the other.
+- A path both sides changed is a **conflict**: `--conflict safe` (the default) reports it and changes neither side, `--conflict local` or `--conflict remote` picks a winner, and `--conflict newest` takes the more recently modified side. The same choice settles a path one side deleted while the other changed it.
+- The first pass for a pair has nothing to compare against, so it copies what only one side has, adopts what both sides already agree on, reports the rest as conflicts, and **never deletes**.
+- `--no-delete` holds back every deletion and reports it instead.
+
+Content identity is a BLAKE3 digest, computed on the remote side by the session worker, so scanning never moves file contents; only files that actually differ are transferred, over SFTP. Digests are remembered per side under the size and timestamp a scan sees for free, so an unchanged tree re-scans without hashing anything.
+
+Symbolic links and special files are skipped, not followed. The executable bit propagates. A directory is only ever removed once it is empty, so content that `--ignore` kept out of the synchronized set is never destroyed — a directory the other side deleted while it still holds ignored, new, or changed content stays put and is reported instead.
+
+The agreed state lives in one JSON file per endpoint pair, by default under `$XDG_STATE_HOME/sshai/sync/` (`--state PATH` overrides it). Deleting that file makes the next pass behave like a first pass, which is the safe way to start over.
 
 Install an SSH public key:
 
