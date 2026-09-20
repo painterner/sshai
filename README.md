@@ -69,11 +69,13 @@ With multiple hosts, sshai connects to the first host and opens its shell immedi
 
 Every session also has a local shell pane, in single-host and multi-host sessions alike. It is the first pane. The local shell is a plain login shell on your own machine (it exports `SSHAI_LOCAL_PANE=1`), keeps its own screen and working directory like any host pane, and running `exit` there closes the entire sshai session just like `exit` on a remote host. `Ctrl+Left` always selects the local pane, while `Ctrl+Right` returns to the next remote host.
 
+Relative local paths in remote-session commands such as `sshai put`, `sshai get`, and local path completion are resolved against the current local pane directory. Changing directory in the local pane therefore changes the base used when you switch back to a remote host.
+
 Press `Shift+Left` or `Shift+Right` once to cycle through the connected remote hosts, in the order `sshai hosts` lists them. Use `Ctrl+Left` to jump directly to the local shell and `Ctrl+Right` to return to the next remote host. The older `Ctrl+Shift+Left` and `Ctrl+Shift+Right` shortcuts are still recognized, although Terminator uses them for pane resizing by default. As a fallback, press `Ctrl+]`, followed by `Left`, `Right`, `h`, or `l`. Pressing `Ctrl+]` twice sends a literal `Ctrl+]` to the remote host. Traditional terminals cannot reliably distinguish `Ctrl+Shift+[` or `Ctrl+Shift+]` from ordinary `Esc` or `Ctrl+]`, nor `Ctrl+Shift+J/L` from newline or clear-screen control characters, so sshai does not reserve those combinations.
 
 Each pane retains its own shell, current directory, foreground process, and VT100 screen state. Switching restores only that host's visible screen; it does not clear shared scrollback, replay old output, or continuously add scrollback lines. Running `exit` normally on the active host closes every host and returns to the local shell once. An unexpected disconnect without an exit status leaves the other live hosts available.
 
-At session startup, sshai lists the local workspace and every target with its working directory, operating system, CPU architecture, and memory. A target still connecting in the background is marked `connecting`. Once every background target has either connected or failed, sshai appends the finished list to every pane and lets that pane's shell repaint its prompt, so no pane is left showing `connecting` for a host that is long since up. Run `sshai hosts` or its alias `sshai info` at any time to see the latest state, including connected, failed, and closed targets:
+At session startup, sshai lists the local workspace and every target with its working directory, operating system, CPU architecture, and memory. A target still connecting in the background is marked `connecting`. When a background target changes state, sshai rewrites the existing connection row in each pane in place; it does not append another connection table or pollute scrollback. Run `sshai hosts` or its alias `sshai info` at any time to see the latest state, including connected, failed, and closed targets:
 
 ```text
 sshai connections
@@ -169,9 +171,9 @@ sshai workspace ssh://dev-server/srv/project exec --pty -- ls --color=auto -C
 sshai workspace ssh://dev-server/srv/project exec --pty --shell -- 'ls'
 ```
 
-`list`, `stat`, `read`, and `hash` accept only relative paths within the workspace root. Absolute paths, `..`, and symbolic links that resolve outside the root are rejected. `list` uses stable name-cursor pagination, and each `read` call returns at most 512 KiB.
+`list`, `stat`, `read`, and `hash` accept relative paths from the workspace root or absolute paths on the remote host. Parent traversal using `..` is rejected. `list` uses stable name-cursor pagination, and each `read` call returns at most 512 KiB.
 
-Workspace `exec` launches an argv vector directly by default, without a shell, and streams independent stdout and stderr events. This behavior is suitable for AI clients and scripts. `--pty` allocates a remote pseudo-terminal and forwards stdin, `TERM`, window dimensions, resize events, and terminal signals. It is suitable for color output, column layouts, and interactive programs; stdout and stderr are combined according to terminal semantics. `--shell` accepts one complete command string and runs it through the remote login shell, explicitly enabling aliases, pipelines, and redirection. The execution directory must be inside the workspace, but the process retains the permissions of the remote SSH user. Commands time out after 300 seconds, and an SSH or agent disconnect terminates the entire remote process group.
+Workspace `exec` launches an argv vector directly by default, without a shell, and streams independent stdout and stderr events. This behavior is suitable for AI clients and scripts. `--pty` allocates a remote pseudo-terminal and forwards stdin, `TERM`, window dimensions, resize events, and terminal signals. It is suitable for color output, column layouts, and interactive programs; stdout and stderr are combined according to terminal semantics. `--shell` accepts one complete command string and runs it through the remote login shell, explicitly enabling aliases, pipelines, and redirection. The process runs with the permissions of the remote SSH login account: connecting locally as `user1` to `root@remote` runs remotely as root, while connecting to `user@remote` runs with that remote user's permissions. Commands time out after 300 seconds, and an SSH or agent disconnect terminates the entire remote process group.
 
 ## Local AI access to local and remote workspaces
 
@@ -214,7 +216,7 @@ Other compatible clients can connect to the MCP server directly:
 sshai mcp ssh://dev-server/srv/project --local-dir ~/projects/app
 ```
 
-The MCP server provides `workspace_info`, `workspace_list`, `workspace_stat`, `workspace_read`, `workspace_hash`, `workspace_write`, `workspace_edit`, `workspace_mkdir`, `workspace_rename`, `workspace_remove`, `workspace_exec`, and `workspace_transfer`. `workspace_info` also reports the remote OS, CPU architecture, and shell. `workspace_transfer` moves files or directories directly between the local workspace and that remote host over SFTP without placing file contents in model context. Local paths must remain under the local workspace root. Remote paths may be relative to the remote workspace or explicitly absolute, such as `/tmp/example`. Symbolic links and special files are rejected, and directory copies require `recursive=true`.
+The MCP server provides `workspace_info`, `workspace_list`, `workspace_stat`, `workspace_read`, `workspace_hash`, `workspace_write`, `workspace_edit`, `workspace_mkdir`, `workspace_rename`, `workspace_remove`, `workspace_exec`, and `workspace_transfer`. `workspace_info` also reports the remote OS, CPU architecture, and shell. `workspace_transfer` moves files or directories directly between the local workspace and that remote host over SFTP without placing file contents in model context. Local paths must remain under the local workspace root. Remote paths may be relative to the remote workspace or explicitly absolute, such as `/tmp/example`. Symbolic links are skipped with warnings and are never followed; special files remain errors. Directory copies require `recursive=true`.
 
 The normal `workspace_transfer` operation never overwrites an existing destination and is pre-approved for the active sshai session in Codex, preventing a duplicate approval prompt after the user has explicitly requested an upload. Only `workspace_transfer_overwrite` may replace files. It remains classified as a write operation and its prompt requires explicit overwrite authorization from the user.
 
@@ -285,7 +287,7 @@ sshai sftp dev-server put -r ./project /srv/project \
   --force
 ```
 
-Directory sources require an explicit `-r` or `--recursive`. Existing files are not overwritten by default; `--force` permits per-file replacement. An `--exclude name` filter excludes matching names at any depth. A filter containing `/` matches a relative subtree within the source directory. Uploads and downloads reject symbolic links and special files and are limited to 100,000 filesystem entries per operation.
+Directory sources require an explicit `-r` or `--recursive`. Existing files are not overwritten by default; `--force` permits per-file replacement. An `--exclude name` filter excludes matching names at any depth. A filter containing `/` matches a relative subtree within the source directory. Uploads and downloads skip symbolic links with warnings, never follow them, reject special files, and are limited to 100,000 filesystem entries per operation.
 
 Keep a local and a remote directory synchronized in both directions, in the shape of Mutagen's safe mode:
 

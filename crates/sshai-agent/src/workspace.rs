@@ -299,14 +299,17 @@ impl WorkspaceRoot {
 
     async fn mkdir(&self, path: &str, recursive: bool) -> Result<WorkspaceValue> {
         let _guard = self.mutations.lock().await;
-        let relative = mutable_relative(path)?;
+        let relative = mutable_path(path)?;
         let target = if recursive {
-            let mut current = self.canonical.as_ref().clone();
+            let mut current = if Path::new(path).is_absolute() {
+                PathBuf::from(std::path::MAIN_SEPARATOR.to_string())
+            } else {
+                self.canonical.as_ref().clone()
+            };
             for component in relative.components() {
-                let Component::Normal(name) = component else {
-                    unreachable!("mutable_relative only returns normal components")
-                };
-                current.push(name);
+                if let Component::Normal(name) = component {
+                    current.push(name);
+                }
                 match fs::symlink_metadata(&current).await {
                     Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
                     Ok(_) => bail!(
@@ -330,8 +333,8 @@ impl WorkspaceRoot {
 
     async fn rename(&self, from: &str, to: &str, overwrite: bool) -> Result<WorkspaceValue> {
         let _guard = self.mutations.lock().await;
-        mutable_relative(from)?;
-        mutable_relative(to)?;
+        mutable_path(from)?;
+        mutable_path(to)?;
         let source = self.resolve_leaf(from).await?;
         fs::symlink_metadata(&source).await?;
         let destination = self.resolve_leaf(to).await?;
@@ -344,7 +347,7 @@ impl WorkspaceRoot {
 
     async fn remove(&self, path: &str, recursive: bool) -> Result<WorkspaceValue> {
         let _guard = self.mutations.lock().await;
-        mutable_relative(path)?;
+        mutable_path(path)?;
         let target = self.resolve_leaf(path).await?;
         let metadata = fs::symlink_metadata(&target).await?;
         if metadata.is_dir() && !metadata.file_type().is_symlink() {
@@ -367,7 +370,7 @@ impl WorkspaceRoot {
         overwrite: bool,
         requested_mode: Option<u32>,
     ) -> Result<WorkspaceValue> {
-        mutable_relative(path)?;
+        mutable_path(path)?;
         let target = self.resolve_leaf(path).await?;
         let existing = match fs::symlink_metadata(&target).await {
             Ok(metadata) => Some(metadata),
@@ -433,9 +436,15 @@ impl WorkspaceRoot {
     }
 
     async fn resolve_existing(&self, path: &str) -> Result<PathBuf> {
-        let relative = validate_relative(path)?;
-        let canonical = fs::canonicalize(self.canonical.join(relative)).await?;
-        if !canonical.starts_with(self.canonical.as_ref()) {
+        let relative = validate_path(path)?;
+        let absolute = Path::new(path).is_absolute();
+        let base = if absolute {
+            relative.clone()
+        } else {
+            self.canonical.join(&relative)
+        };
+        let canonical = fs::canonicalize(base).await?;
+        if !absolute && !canonical.starts_with(self.canonical.as_ref()) {
             bail!("path escapes the workspace root: {path}");
         }
         Ok(canonical)
@@ -450,7 +459,8 @@ impl WorkspaceRoot {
     }
 
     async fn resolve_leaf(&self, path: &str) -> Result<PathBuf> {
-        let relative = validate_relative(path)?;
+        let relative = validate_path(path)?;
+        let absolute = Path::new(path).is_absolute();
         if relative.as_os_str().is_empty() {
             return Ok(self.canonical.as_ref().clone());
         }
@@ -458,20 +468,25 @@ impl WorkspaceRoot {
         let name = relative
             .file_name()
             .ok_or_else(|| anyhow!("invalid workspace path"))?;
-        let canonical_parent = fs::canonicalize(self.canonical.join(parent)).await?;
-        if !canonical_parent.starts_with(self.canonical.as_ref()) {
+        let parent_base = if absolute {
+            parent.to_owned()
+        } else {
+            self.canonical.join(parent)
+        };
+        let canonical_parent = fs::canonicalize(parent_base).await?;
+        if !absolute && !canonical_parent.starts_with(self.canonical.as_ref()) {
             bail!("path escapes the workspace root: {path}");
         }
         Ok(canonical_parent.join(name))
     }
 }
 
-fn mutable_relative(path: &str) -> Result<PathBuf> {
-    let relative = validate_relative(path)?;
-    if relative.as_os_str().is_empty() {
-        bail!("refusing to mutate the workspace root");
+fn mutable_path(path: &str) -> Result<PathBuf> {
+    let path = validate_path(path)?;
+    if path.as_os_str().is_empty() || path == Path::new("/") {
+        bail!("refusing to mutate the filesystem root");
     }
-    Ok(relative)
+    Ok(path)
 }
 
 async fn path_exists(path: &Path) -> Result<bool> {
@@ -566,15 +581,16 @@ impl FileSync {
     }
 }
 
-fn validate_relative(path: &str) -> Result<PathBuf> {
+fn validate_path(path: &str) -> Result<PathBuf> {
     let path = if path.is_empty() { "." } else { path };
     let mut result = PathBuf::new();
     for component in Path::new(path).components() {
         match component {
             Component::Normal(value) => result.push(value),
             Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                bail!("workspace paths must be relative and cannot contain '..': {path}")
+            Component::RootDir => result.push(std::path::MAIN_SEPARATOR.to_string()),
+            Component::ParentDir | Component::Prefix(_) => {
+                bail!("workspace paths cannot contain '..': {path}")
             }
         }
     }
@@ -635,11 +651,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rejects_absolute_and_parent_paths() {
-        assert!(validate_relative("../secret").is_err());
-        assert!(validate_relative("/etc/passwd").is_err());
+    fn rejects_relative_parent_paths_but_accepts_absolute_paths() {
+        assert!(validate_path("../secret").is_err());
         assert_eq!(
-            validate_relative("src/./main.rs").unwrap(),
+            validate_path("/etc/passwd").unwrap(),
+            Path::new("/etc/passwd")
+        );
+        assert_eq!(
+            validate_path("src/./main.rs").unwrap(),
             Path::new("src/main.rs")
         );
     }
@@ -654,6 +673,14 @@ mod tests {
             .await
             .unwrap();
         let workspace = WorkspaceRoot::open(temporary.path()).await.unwrap();
+
+        let absolute_stat = workspace
+            .perform(WorkspaceOperation::Stat {
+                path: temporary.path().join("alpha.txt").display().to_string(),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(absolute_stat, WorkspaceValue::Stat { .. }));
 
         let listed = workspace
             .perform(WorkspaceOperation::List {

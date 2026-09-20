@@ -867,6 +867,12 @@ impl SessionCommandHandler for AiSessionCommand {
         matches!(command, "--agent" | "--file")
     }
 
+    fn update_local_root(&mut self, root: Option<std::path::PathBuf>) {
+        if let Some(root) = root {
+            self.local_root = root;
+        }
+    }
+
     async fn handle_input(&mut self, input: Vec<u8>) -> SessionInputResult {
         if self.file_edit.is_none() {
             return SessionInputResult {

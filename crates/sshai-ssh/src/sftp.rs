@@ -36,11 +36,12 @@ pub struct RemoteDirEntry {
     pub executable: bool,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct SftpTransferStats {
     pub bytes: u64,
     pub files: u64,
     pub directories: u64,
+    pub warnings: Vec<String>,
 }
 
 /// A small stable wrapper around `russh-sftp` used for bootstrap transfers.
@@ -310,6 +311,13 @@ impl SftpClient {
         excludes: &[String],
     ) -> Result<SftpTransferStats> {
         let local = local.as_ref();
+        let initial_metadata = std::fs::symlink_metadata(local).map_err(SshError::Io)?;
+        if initial_metadata.file_type().is_symlink() {
+            return Ok(SftpTransferStats {
+                warnings: vec![format!("skipping local symlink {}", local.display())],
+                ..Default::default()
+            });
+        }
         ensure_no_local_symlink(local)?;
         let source = local.canonicalize().map_err(SshError::Io)?;
         let metadata = std::fs::symlink_metadata(&source).map_err(SshError::Io)?;
@@ -329,6 +337,7 @@ impl SftpClient {
                 bytes,
                 files: 1,
                 directories: 0,
+                ..Default::default()
             });
         }
         if !metadata.is_dir() {
@@ -348,13 +357,13 @@ impl SftpClient {
             if transfer_excluded(&relative, excludes) {
                 continue;
             }
-            ensure_transfer_limit(stats)?;
+            ensure_transfer_limit(&stats)?;
             let metadata = std::fs::symlink_metadata(&local).map_err(SshError::Io)?;
             if metadata.file_type().is_symlink() {
-                return Err(SshError::Config(format!(
-                    "refusing to transfer local symlink {}",
-                    local.display()
-                )));
+                stats
+                    .warnings
+                    .push(format!("skipping local symlink {}", local.display()));
+                continue;
             }
             if metadata.is_dir() {
                 if remote != "." {
@@ -403,9 +412,10 @@ impl SftpClient {
         ensure_no_local_symlink(local)?;
         let metadata = self.inner.symlink_metadata(remote.clone()).await?;
         if metadata.is_symlink() {
-            return Err(SshError::Config(format!(
-                "refusing to transfer remote symlink {remote}"
-            )));
+            return Ok(SftpTransferStats {
+                warnings: vec![format!("skipping remote symlink {remote}")],
+                ..Default::default()
+            });
         }
         if metadata.is_regular() {
             ensure_local_parent(local)?;
@@ -415,6 +425,7 @@ impl SftpClient {
                 bytes,
                 files: 1,
                 directories: 0,
+                ..Default::default()
             });
         }
         if !metadata.is_dir() {
@@ -434,7 +445,7 @@ impl SftpClient {
             if transfer_excluded(&relative, excludes) {
                 continue;
             }
-            ensure_transfer_limit(stats)?;
+            ensure_transfer_limit(&stats)?;
             ensure_local_directory(&local)?;
             stats.directories += 1;
 
@@ -452,15 +463,15 @@ impl SftpClient {
                 if metadata.is_dir() {
                     stack.push((child_remote, child_local, child_relative));
                 } else if metadata.is_regular() {
-                    ensure_transfer_limit(stats)?;
+                    ensure_transfer_limit(&stats)?;
                     ensure_local_parent(&child_local)?;
                     stats.bytes += self.download(child_remote, &child_local, overwrite).await?;
                     set_local_permissions(&child_local, metadata.permissions, false)?;
                     stats.files += 1;
                 } else if metadata.is_symlink() {
-                    return Err(SshError::Config(format!(
-                        "refusing to transfer remote symlink {child_remote}"
-                    )));
+                    stats
+                        .warnings
+                        .push(format!("skipping remote symlink {child_remote}"));
                 } else {
                     return Err(SshError::Config(format!(
                         "refusing to transfer special remote file {child_remote}"
@@ -717,7 +728,7 @@ fn transfer_excluded(relative: &Path, excludes: &[String]) -> bool {
     })
 }
 
-fn ensure_transfer_limit(stats: SftpTransferStats) -> Result<()> {
+fn ensure_transfer_limit(stats: &SftpTransferStats) -> Result<()> {
     if stats.files + stats.directories >= MAX_TRANSFER_ENTRIES {
         return Err(SshError::Config(format!(
             "transfer exceeds {MAX_TRANSFER_ENTRIES} filesystem entries"

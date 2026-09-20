@@ -59,6 +59,10 @@ pub struct SessionInputResult {
 pub trait SessionCommandHandler: Send {
     fn handles(&self, command: &str) -> bool;
 
+    /// Update the local workspace used by local-side session commands. The
+    /// multiplexer calls this when the local pane's shell changes directory.
+    fn update_local_root(&mut self, _root: Option<PathBuf>) {}
+
     async fn handle_input(&mut self, input: Vec<u8>) -> SessionInputResult {
         SessionInputResult {
             forward: input,
@@ -182,6 +186,7 @@ struct MultiplexedShell {
 }
 
 struct LocalShell {
+    pid: u32,
     commands: mpsc::Sender<MultiplexCommand>,
     task: Option<tokio::task::JoinHandle<()>>,
     terminal: VirtualTerminal,
@@ -1661,6 +1666,15 @@ impl SshSession {
     }
 
     async fn handle_control_request(&self, request: ControlRequest) -> ControlResponse {
+        self.handle_control_request_with_local_root(request, None)
+            .await
+    }
+
+    async fn handle_control_request_with_local_root(
+        &self,
+        request: ControlRequest,
+        local_root: Option<&Path>,
+    ) -> ControlResponse {
         let id = request.id;
         let result = match request.argv.first().map(String::as_str) {
             Some("copy-id") => self.control_copy_id(&request.argv[1..]).await,
@@ -1669,6 +1683,7 @@ impl SshSession {
                     TransferDirection::Get,
                     &request.argv[1..],
                     request.cwd.as_deref(),
+                    local_root,
                 )
                 .await
             }
@@ -1677,6 +1692,7 @@ impl SshSession {
                     TransferDirection::Put,
                     &request.argv[1..],
                     request.cwd.as_deref(),
+                    local_root,
                 )
                 .await
             }
@@ -1686,7 +1702,7 @@ impl SshSession {
             )),
             Some("help") | Some("--help") | Some("-h") => Ok(control_help().to_owned()),
             // Hidden helper behind the remote shell's completion for `put`.
-            Some("--complete-local") => control_complete_local(&request.argv[1..]),
+            Some("--complete-local") => control_complete_local(&request.argv[1..], local_root),
             Some(command) => Err(SshError::Agent(format!(
                 "unknown session command {command:?}; use `sshai --agent {command}` for a local AI CLI, or try `sshai help`"
             ))),
@@ -1762,6 +1778,7 @@ impl SshSession {
         direction: TransferDirection,
         arguments: &[String],
         remote_cwd: Option<&str>,
+        local_root: Option<&Path>,
     ) -> Result<String> {
         if matches!(arguments, [argument] if argument == "-h" || argument == "--help") {
             return Ok(direction.usage().to_owned());
@@ -1773,7 +1790,11 @@ impl SshSession {
         };
         let mut local = expand_local_home(local_argument)?;
         if local.is_relative() {
-            local = env::current_dir().map_err(SshError::Io)?.join(local);
+            let base = match local_root {
+                Some(root) => root.to_owned(),
+                None => env::current_dir().map_err(SshError::Io)?,
+            };
+            local = base.join(local);
         }
         let mut local = clean_local_path(local);
         let sftp = self.sftp().await?;
@@ -1826,11 +1847,16 @@ impl SshSession {
                 TransferDirection::Put => (local, remote),
             };
             Ok::<_, SshError>(format!(
-                "{} {from} -> {to}\ntransferred {} bytes in {} files and {} directories\n",
+                "{} {from} -> {to}\ntransferred {} bytes in {} files and {} directories\n{}",
                 direction.name(),
                 stats.bytes,
                 stats.files,
                 stats.directories,
+                stats
+                    .warnings
+                    .iter()
+                    .map(|warning| format!("warning: {warning}\n"))
+                    .collect::<String>(),
             ))
         }
         .await;
@@ -1865,7 +1891,7 @@ async fn run_multiplexed_shells(
     let total = targets.len();
     let panes = total + 1;
     let labels = targets.iter().map(ToString::to_string).collect::<Vec<_>>();
-    let local_summary = local_connection_summary();
+    let mut local_summary = local_connection_summary();
     let (events_tx, mut events_rx) = mpsc::channel(256);
     let primary_shell = prepare_multiplexed_shell(
         0,
@@ -2062,6 +2088,7 @@ async fn run_multiplexed_shells(
                                                 }
                                             }
                                         }
+                                        refresh_local_summary(&mut local_summary, local.as_ref());
                                         active = Some(next);
                                         if passthrough && matches!(next, Pane::Remote(_)) {
                                             if let Some(commands) = pane_commands(&shells, local.as_ref(), active) {
@@ -2102,17 +2129,16 @@ async fn run_multiplexed_shells(
                             shell.terminal.process(overview.as_bytes());
                             start_multiplexed_shell(shell);
                         }
-                        if pending_connections == 0 {
-                            broadcast_pane_notice(
-                                &mut stdout,
-                                &mut shells,
-                                local.as_mut(),
-                                active,
-                                Some(Pane::Remote(index)),
-                                settled_overview(&overview).as_bytes(),
-                            )
-                            .await?;
-                        }
+                        refresh_connection_overviews(
+                            &mut stdout,
+                            &mut shells,
+                            local.as_mut(),
+                            active,
+                            &local_summary,
+                            &labels,
+                            &statuses,
+                        )
+                        .await?;
                         if passthrough {
                             if let Some(shell) = shells[index].as_ref() {
                                 let _ = shell
@@ -2136,24 +2162,16 @@ async fn run_multiplexed_shells(
                     MultiplexEvent::Failed { index, error } => {
                         pending_connections = pending_connections.saturating_sub(1);
                         statuses[index] = format!("failed: {error}");
-                        if pending_connections == 0 {
-                            let overview = connection_overview(
-                                &local_summary,
-                                &shells,
-                                &labels,
-                                &statuses,
-                                true,
-                            );
-                            broadcast_pane_notice(
-                                &mut stdout,
-                                &mut shells,
-                                local.as_mut(),
-                                active,
-                                None,
-                                settled_overview(&overview).as_bytes(),
-                            )
-                            .await?;
-                        }
+                        refresh_connection_overviews(
+                            &mut stdout,
+                            &mut shells,
+                            local.as_mut(),
+                            active,
+                            &local_summary,
+                            &labels,
+                            &statuses,
+                        )
+                        .await?;
                         if active.is_none() && pending_connections == 0 {
                             break 'multiplexer;
                         }
@@ -2190,6 +2208,10 @@ async fn run_multiplexed_shells(
                         let Some(shell) = shells.get(index).and_then(Option::as_ref) else {
                             continue;
                         };
+                        let local_cwd = local.as_ref().and_then(local_shell_cwd);
+                        if let Some(cwd) = local_cwd.as_ref() {
+                            local_summary.workspace_root = cwd.to_string_lossy().into_owned();
+                        }
                         let session = Arc::clone(&shell.session);
                         let commands = shell.commands.clone();
                         let external_command = request.argv.first().and_then(|command| {
@@ -2213,6 +2235,7 @@ async fn run_multiplexed_shells(
                                 stderr: String::new(),
                             }
                         } else if let Some(command) = external_command {
+                            handler.update_local_root(local_cwd.clone());
                             drop(raw_mode.take());
                             let result = handler
                                 .handle(
@@ -2242,7 +2265,12 @@ async fn run_multiplexed_shells(
                             // Built-in commands can transfer whole directories, so
                             // they answer from a task instead of stalling the panes.
                             tokio::spawn(async move {
-                                let response = session.handle_control_request(request).await;
+                                let response = session
+                                    .handle_control_request_with_local_root(
+                                        request,
+                                        local_cwd.as_deref(),
+                                    )
+                                    .await;
                                 let _ = commands
                                     .send(MultiplexCommand::ControlResponse(response))
                                     .await;
@@ -2269,13 +2297,14 @@ async fn run_multiplexed_shells(
                         if active_shell_exited_normally {
                             break 'multiplexer;
                         }
-                        broadcast_pane_notice(
+                        refresh_connection_overviews(
                             &mut stdout,
                             &mut shells,
                             local.as_mut(),
                             active,
-                            Some(Pane::Remote(index)),
-                            &pane_status_notice(31, &labels[index], "closed", pending_connections),
+                            &local_summary,
+                            &labels,
+                            &statuses,
                         )
                         .await?;
                         if active == Some(Pane::Remote(index)) {
@@ -2429,9 +2458,13 @@ async fn prepare_local_shell(events: mpsc::Sender<MultiplexEvent>) -> Result<Loc
         });
     }
     let child = command.spawn()?;
+    let pid = child
+        .id()
+        .ok_or_else(|| SshError::Config("local shell has no process id".to_owned()))?;
     let (commands, command_rx) = mpsc::channel(64);
     let task = tokio::spawn(run_local_shell_actor(master, child, command_rx, events));
     Ok(LocalShell {
+        pid,
         commands,
         task: Some(task),
         terminal: VirtualTerminal::new(columns, rows),
@@ -2444,6 +2477,25 @@ async fn prepare_local_shell(_events: mpsc::Sender<MultiplexEvent>) -> Result<Lo
     Err(SshError::Config(
         "the local shell pane is not implemented on this platform".to_owned(),
     ))
+}
+
+/// Return the actual working directory of the local pane shell. On Linux the
+/// kernel exposes this without asking the shell to echo a prompt marker, so it
+/// works consistently across bash, zsh, fish, and custom shells.
+#[cfg(target_os = "linux")]
+fn local_shell_cwd(shell: &LocalShell) -> Option<PathBuf> {
+    std::fs::read_link(format!("/proc/{}/cwd", shell.pid)).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn local_shell_cwd(_shell: &LocalShell) -> Option<PathBuf> {
+    None
+}
+
+fn refresh_local_summary(summary: &mut LocalConnectionSummary, local: Option<&LocalShell>) {
+    if let Some(cwd) = local.and_then(local_shell_cwd) {
+        summary.workspace_root = cwd.to_string_lossy().into_owned();
+    }
 }
 
 #[cfg(unix)]
@@ -2887,78 +2939,47 @@ fn passthrough_export(enabled: bool) -> Vec<u8> {
     format!("export SSHAI_PASSTHROUGH={}\n", if enabled { 1 } else { 0 }).into_bytes()
 }
 
-/// The connection list as panes that already saw the startup copy need it: on
-/// its own line, and without repeating the shortcut hint.
-fn settled_overview(overview: &str) -> String {
-    format!(
-        "\r\n{}",
-        overview
-            .strip_suffix(MULTIPLEX_SWITCH_HINT)
-            .unwrap_or(overview)
-    )
-}
-
-/// One line summarizing a host's new state, for panes that are showing an
-/// older copy of the connection list.
-fn pane_status_notice(color: u8, label: &str, status: &str, pending: usize) -> Vec<u8> {
-    let tail = if pending > 0 {
-        format!("; {pending} still connecting")
-    } else {
-        String::new()
-    };
-    format!(
-        "\r\n\x1b[{color}m[sshai] {} {}{tail}\x1b[0m\r\n",
-        display_label(label),
-        display_label(status),
-    )
-    .into_bytes()
-}
-
-/// Append a notice to every open pane except `skip`, and to the terminal when
-/// the pane in view is one of them.
-async fn broadcast_pane_notice(
+/// Rewrite the connection table in place in every pane. This deliberately
+/// uses cursor movement instead of appending a second table, so a background
+/// host changing from `connecting` to `connected` never pollutes scrollback.
+async fn refresh_connection_overviews(
     stdout: &mut tokio::io::Stdout,
     shells: &mut [Option<MultiplexedShell>],
     local: Option<&mut LocalShell>,
     active: Option<Pane>,
-    skip: Option<Pane>,
-    notice: &[u8],
+    summary: &LocalConnectionSummary,
+    labels: &[String],
+    statuses: &[String],
 ) -> Result<()> {
-    for (index, shell) in shells.iter_mut().enumerate() {
-        if skip == Some(Pane::Remote(index)) {
-            continue;
-        }
+    let mut local = local;
+    let overview = connection_overview(summary, shells, labels, statuses, true);
+    let repaint = connection_overview_repaint(&overview);
+    for shell in shells.iter_mut() {
         if let Some(shell) = shell.as_mut().filter(|shell| shell.open) {
-            shell.terminal.process(notice);
+            shell.terminal.process(&repaint);
         }
     }
-    let mut local_commands = None;
-    if skip != Some(Pane::Local) {
-        if let Some(shell) = local.filter(|shell| shell.open) {
-            shell.terminal.process(notice);
-            local_commands = Some(shell.commands.clone());
-        }
+    if let Some(shell) = local.as_deref_mut().filter(|shell| shell.open) {
+        shell.terminal.process(&repaint);
     }
-    let Some(active) = active.filter(|pane| Some(*pane) != skip) else {
-        return Ok(());
-    };
-    stdout.write_all(notice).await?;
-    stdout.flush().await?;
-    // The notice lands where the shell left its prompt, so ask that shell to
-    // repaint: readline and full-screen programs redraw on a window change.
-    let commands = match active {
-        Pane::Local => local_commands,
-        Pane::Remote(index) => shells
-            .get(index)
-            .and_then(Option::as_ref)
-            .filter(|shell| shell.open)
-            .map(|shell| shell.commands.clone()),
-    };
-    if let Some(commands) = commands {
-        let (columns, rows) = terminal_size();
-        let _ = commands.send(MultiplexCommand::Resize(columns, rows)).await;
+    if active.is_some_and(|pane| pane_is_open(shells, local.as_deref(), pane)) {
+        stdout.write_all(&repaint).await?;
+        stdout.flush().await?;
     }
     Ok(())
+}
+
+fn connection_overview_repaint(overview: &str) -> Vec<u8> {
+    let mut output = b"\x1b7".to_vec();
+    for (row, line) in overview
+        .split("\r\n")
+        .filter(|line| !line.is_empty())
+        .enumerate()
+    {
+        output.extend_from_slice(format!("\x1b[{};1H\x1b[2K{line}", row + 1).as_bytes());
+    }
+    output.extend_from_slice(b"\x1b8");
+    output
 }
 
 async fn render_pane(
@@ -3718,9 +3739,12 @@ Ctrl+\\\\ toggles smart command wrappers; passthrough mode uses the remote comma
 
 const LOCAL_COMPLETION_LIMIT: usize = 500;
 
-fn control_complete_local(arguments: &[String]) -> Result<String> {
+fn control_complete_local(arguments: &[String], local_root: Option<&Path>) -> Result<String> {
     let prefix = arguments.first().map(String::as_str).unwrap_or_default();
-    let cwd = env::current_dir().map_err(SshError::Io)?;
+    let cwd = match local_root {
+        Some(root) => root.to_owned(),
+        None => env::current_dir().map_err(SshError::Io)?,
+    };
     let mut candidates = local_path_completions(prefix, &cwd)?;
     if candidates.is_empty() {
         return Ok(String::new());
@@ -4265,31 +4289,18 @@ mod tests {
     }
 
     #[test]
-    fn settled_overview_starts_a_line_and_drops_the_repeated_hint() {
-        let overview = format!(
-            "\x1b[1;36m[sshai connections]\r\n  1. local: /home\r\n{MULTIPLEX_SWITCH_HINT}"
+    fn connection_overview_repaint_rewrites_in_place_without_scrollback() {
+        let overview =
+            "\x1b[1;36m[sshai connections]\r\n  1. local: /home\r\n  2. host: connected\r\n";
+        let repaint = connection_overview_repaint(overview);
+        assert!(repaint.starts_with(b"\x1b7\x1b[1;1H\x1b[2K"));
+        assert!(
+            repaint
+                .windows(b"host: connected".len())
+                .any(|window| window == b"host: connected")
         );
-        let settled = settled_overview(&overview);
-        assert!(settled.starts_with("\r\n\x1b[1;36m[sshai connections]"));
-        assert!(settled.ends_with("  1. local: /home\r\n"));
-        assert!(!settled.contains("switches panes"));
-        // An overview without the hint is only moved onto its own line.
-        assert_eq!(
-            settled_overview("  2. host: ready\r\n"),
-            "\r\n  2. host: ready\r\n"
-        );
-    }
-
-    #[test]
-    fn host_status_notices_report_the_remaining_connections() {
-        let notice = pane_status_notice(32, "build\u{7}", "connected", 2);
-        let text = String::from_utf8(notice).unwrap();
-        assert_eq!(
-            text,
-            "\r\n\x1b[32m[sshai] build connected; 2 still connecting\x1b[0m\r\n"
-        );
-        let last = String::from_utf8(pane_status_notice(31, "test", "failed: timeout", 0)).unwrap();
-        assert_eq!(last, "\r\n\x1b[31m[sshai] test failed: timeout\x1b[0m\r\n");
+        assert!(repaint.ends_with(b"\x1b8"));
+        assert!(!repaint.starts_with(b"\r\n"));
     }
 
     #[test]
@@ -4803,6 +4814,7 @@ mod tests {
 
     fn test_local_shell(open: bool) -> LocalShell {
         LocalShell {
+            pid: 0,
             commands: mpsc::channel(1).0,
             task: None,
             terminal: VirtualTerminal::new(80, 24),

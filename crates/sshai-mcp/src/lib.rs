@@ -622,7 +622,7 @@ async fn handle_request(remote: &RemoteHandle, message: &Value) -> Result<Value>
                 "protocolVersion": protocol,
                 "capabilities": {"tools": {"listChanged": false}},
                 "serverInfo": {"name": "sshai", "version": env!("CARGO_PKG_VERSION")},
-                "instructions": format!("This is the REMOTE side of an sshai dual-workspace session. Native file and shell tools operate on LOCAL; workspace_* tools operate on REMOTE. Ordinary workspace paths are relative to the negotiated remote root. Use workspace_transfer for direct non-overwriting LOCAL/REMOTE copies; its remote_path may also be absolute. Only use workspace_transfer_overwrite after the user explicitly requests replacement. A remote cp command cannot read LOCAL files. {transport_instructions}")
+                "instructions": format!("This is the REMOTE side of an sshai dual-workspace session. Native file and shell tools operate on LOCAL; workspace_* tools operate on REMOTE. Workspace paths may be relative to the negotiated remote root or absolute paths on the remote host. Use workspace_transfer for direct non-overwriting LOCAL/REMOTE copies; its remote_path may also be absolute. Only use workspace_transfer_overwrite after the user explicitly requests replacement. A remote cp command cannot read LOCAL files. {transport_instructions}")
             }))
         }
         "server/discover" => Ok(json!({

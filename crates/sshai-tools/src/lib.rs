@@ -4,6 +4,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use serde_json::{Map, Value, json};
 use sshai_ssh::{MAX_WORKSPACE_READ, WorkspaceClient, WorkspaceFileKind, WorkspaceMutation};
+use std::path::Path;
 
 /// Return MCP-compatible tool definitions.
 pub fn definitions() -> Vec<Value> {
@@ -80,7 +81,7 @@ pub fn definitions() -> Vec<Value> {
         ),
         tool(
             "workspace_exec",
-            "Run argv directly in the remote environment. Use this for all shell, Git, build, and test commands.",
+            "Run argv directly in the remote environment. Use this for all shell, Git, build, and test commands. cwd is normally relative to the negotiated workspace root; that root or a path beneath it may also be supplied as an absolute path.",
             json!({"type":"object","properties":{"command":{"type":"array","items":{"type":"string"},"minItems":1},"cwd":{"type":"string"},"env":{"type":"object","additionalProperties":{"type":"string"}}},"required":["command"]}),
             false,
             true,
@@ -267,6 +268,7 @@ pub async fn dispatch(
                 bail!("command must not be empty");
             }
             let cwd = optional_string(arguments, "cwd").unwrap_or_else(|| ".".to_owned());
+            let cwd = normalize_exec_cwd(workspace.root(), &cwd)?;
             let env = arguments
                 .get("env")
                 .and_then(Value::as_object)
@@ -360,6 +362,29 @@ fn optional_bool(arguments: &Map<String, Value>, key: &str) -> Option<bool> {
     arguments.get(key).and_then(Value::as_bool)
 }
 
+/// Workspace RPC paths are relative to the negotiated root. AI clients often
+/// copy the absolute root returned by `workspace_info` into `workspace_exec`;
+/// accept that root (and descendants) at this adapter boundary and normalize
+/// them before sending the strict protocol request.
+fn normalize_exec_cwd(root: &str, cwd: &str) -> Result<String> {
+    if cwd.is_empty() {
+        return Ok(".".to_owned());
+    }
+    let path = Path::new(cwd);
+    if !path.is_absolute() {
+        return Ok(cwd.to_owned());
+    }
+    let root = Path::new(root);
+    let relative = path.strip_prefix(root).map_err(|_| {
+        anyhow!("workspace_exec cwd must be relative to workspace root {root:?}: {cwd:?}")
+    })?;
+    if relative.as_os_str().is_empty() {
+        Ok(".".to_owned())
+    } else {
+        Ok(relative.to_string_lossy().into_owned())
+    }
+}
+
 fn file_kind(kind: WorkspaceFileKind) -> &'static str {
     match kind {
         WorkspaceFileKind::File => "file",
@@ -412,5 +437,16 @@ mod tests {
             assert!(requires_approval(name), "{name}");
         }
         assert!(!requires_approval("workspace_read"));
+    }
+
+    #[test]
+    fn normalizes_workspace_root_cwds() {
+        assert_eq!(normalize_exec_cwd("/root", "/root").unwrap(), ".");
+        assert_eq!(
+            normalize_exec_cwd("/root", "/root/project").unwrap(),
+            "project"
+        );
+        assert_eq!(normalize_exec_cwd("/root", ".").unwrap(), ".");
+        assert!(normalize_exec_cwd("/root", "/etc").is_err());
     }
 }

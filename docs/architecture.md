@@ -150,7 +150,7 @@ exec.signal / cancel         process-group control
 exec.output / exited         backpressured events and final status
 ```
 
-Filesystem paths are relative-only. The agent normalizes components, canonicalizes the target or its parent, and verifies it remains under the canonical workspace root. This rejects absolute paths, parent traversal, and symlink escapes while still allowing `stat` to report a final symlink itself.
+Filesystem paths may be relative to the negotiated workspace root or absolute on the remote host. The agent normalizes components, canonicalizes the target or its parent, rejects parent traversal, and preserves symlink checks for mutation safety. Absolute paths intentionally retain the authenticated remote user's normal permissions so sshai can manage the host outside a project workspace.
 
 `exec` constrains and canonicalizes its initial working directory, validates environment names, and uses argv directly without a shell by default. Pipe mode streams distinct stdout/stderr chunks through a bounded event queue. PTY mode uses `openpty`, creates a new session and foreground process group, forwards stdin/`TERM`/window resize, and merges output with normal terminal semantics. `--shell` is explicit and requires one command string.
 
